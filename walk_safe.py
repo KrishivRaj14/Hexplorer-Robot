@@ -12,7 +12,7 @@ However it ends (target reached, obstacle, Ctrl+C, a dropped SSH connection, an
 error), the robot stops walking and ends in damping mode.
 
 The LiDAR is tilted on the robot, so the floor is not at a fixed height in the
-LiDAR's view. Every frame the script finds the floor plane itself (RANSAC) and
+LiDAR's view. Every frame the script finds the floor itself (the lowest surface) and
 only counts points that stick up from it as obstacles. It ignores the robot's
 own body (closer than --xmin) and stops if it cannot see the floor.
 
@@ -35,38 +35,62 @@ import numpy as np
 
 
 # ---------------------------------------------------------------- geometry
-def fit_floor(p, rng, iters=150, thresh=0.03):
+def fit_floor(p, rng, cell=0.25):
     """Find the floor plane z = a*x + b*y + c in LiDAR coordinates.
 
-    p: Nx3 candidate points. Returns (a, b, c) or None. The plane must be
-    within ~35 degrees of level (relative to the LiDAR) and between 5 cm and
-    1.2 m below the LiDAR, which rules out walls and the ceiling.
+    The floor is the LOWEST surface the LiDAR sees. So for every 25 cm square
+    of ground we keep its 2nd-lowest point (ignoring one stray point), then fit
+    a plane to those points with RANSAC and refine it.
+    Returns ((a, b, c) or None, text explaining the result).
     """
-    n = len(p)
-    if n < 400:
-        return None
-    idx = rng.integers(0, n, (iters, 3))
-    A, B, C = p[idx[:, 0]], p[idx[:, 1]], p[idx[:, 2]]
-    nr = np.cross(B - A, C - A).astype(np.float64)
+    if len(p) < 400:
+        return None, f"only {len(p)} points"
+    ix = np.floor(p[:, 0] / cell).astype(np.int64) + 200
+    iy = np.floor(p[:, 1] / cell).astype(np.int64) + 200
+    key = ix * 1000 + iy
+    order = np.lexsort((p[:, 2], key))
+    ks = key[order]
+    starts = np.flatnonzero(np.r_[True, ks[1:] != ks[:-1]])
+    sizes = np.diff(np.r_[starts, len(ks)])
+    ok = sizes >= 6
+    Q = p[order[starts[ok] + 1]].astype(np.float64)      # 2nd-lowest per cell
+    nq = len(Q)
+    if nq < 15:
+        return None, f"only {nq} ground cells"
+    idx = rng.integers(0, nq, (400, 3))
+    A, B, C = Q[idx[:, 0]], Q[idx[:, 1]], Q[idx[:, 2]]
+    nr = np.cross(B - A, C - A)
     ln = np.linalg.norm(nr, axis=1)
-    good = ln > 1e-4
+    good = ln > 1e-6
     nr = nr / np.where(good, ln, 1.0)[:, None]
     nr[nr[:, 2] < 0] *= -1
-    d = -np.einsum("ij,ij->i", nr, A.astype(np.float64))
+    d = -np.einsum("ij,ij->i", nr, A)
     good &= nr[:, 2] > 0.82
     good &= (d > 0.05 * nr[:, 2]) & (d < 1.2 * nr[:, 2])
     if not good.any():
-        return None
-    dist = np.abs(p.astype(np.float64) @ nr.T + d)
-    inl = (dist < thresh).sum(axis=0)
+        return None, f"no level plane among {nq} ground cells"
+    dist = np.abs(Q @ nr.T + d)
+    inl = (dist < 0.04).sum(axis=0)
     inl[~good] = 0
     k = int(np.argmax(inl))
-    if inl[k] < max(300, 0.10 * n):
-        return None
-    m = dist[:, k] < 2 * thresh
-    X = np.c_[p[m, 0], p[m, 1], np.ones(int(m.sum()))]
-    coef, *_ = np.linalg.lstsq(X, p[m, 2].astype(np.float64), rcond=None)
-    return float(coef[0]), float(coef[1]), float(coef[2])
+    if inl[k] < max(12, int(0.4 * nq)):
+        return None, f"best plane fits only {int(inl[k])} of {nq} ground cells"
+    m = dist[:, k] < 0.04
+    for _ in range(3):
+        X = np.c_[Q[m, 0], Q[m, 1], np.ones(int(m.sum()))]
+        coef, *_ = np.linalg.lstsq(X, Q[m, 2], rcond=None)
+        res = np.abs(Q[:, 2] - (Q[:, 0] * coef[0] + Q[:, 1] * coef[1] + coef[2]))
+        m = res < 0.04
+        if m.sum() < 12:
+            return None, "plane fit collapsed"
+    G = Q[m]
+    near = G[np.hypot(G[:, 0], G[:, 1]) < 2.0]
+    if len(near) < 8 or np.ptp(np.hypot(G[:, 0], G[:, 1])) < 0.8:
+        return None, "no floor seen within 2 m"
+    a, b, c = (float(v) for v in coef)
+    if 1.0 / math.sqrt(1 + a * a + b * b) < 0.82 or not (-1.2 < c < -0.05):
+        return None, f"implausible floor (LiDAR {-c:.2f} m up)"
+    return (a, b, c), f"{int(m.sum())} of {nq} ground cells"
 
 
 def analyze(pts, a, rng, plane):
@@ -74,6 +98,7 @@ def analyze(pts, a, rng, plane):
 
     Returns a dict:
       floor_ok: the floor plane was found (or reused for up to 1 s)
+      info:     short text about the floor fit (for debugging)
       tilt:     how far the floor is tilted in the LiDAR's view (degrees)
       clr:      LiDAR height above the floor (m)
       front:    distance ahead (m) of the nearest obstacle in the corridor in
@@ -86,20 +111,19 @@ def analyze(pts, a, rng, plane):
     p = np.asarray(pts, dtype=np.float32)[:, :3]
     p = p[np.isfinite(p).all(axis=1) & np.any(p != 0, axis=1)]
     now = time.time()
-    r = np.linalg.norm(p, axis=1)
-    cand = p[(r > a.xmin) & (r < 4.0)]
-    if len(cand) > 4000:
-        cand = cand[rng.choice(len(cand), 4000, replace=False)]
-    coef = fit_floor(cand, rng)
+    r = np.hypot(p[:, 0], p[:, 1])
+    coef, info = fit_floor(p[(r > a.xmin) & (r < 3.5)], rng)
     if coef is not None:
         plane["coef"], plane["t"] = coef, now
     elif plane["coef"] is None or now - plane["t"] > 1.0:
-        return dict(floor_ok=False, tilt=None, clr=None, front=None, n=0, raw=None)
+        return dict(floor_ok=False, info=info, tilt=None, clr=None, front=None,
+                    n=0, raw=None)
     ca, cb, cc = plane["coef"]
     h = p[:, 2] - (ca * p[:, 0] + cb * p[:, 1] + cc)      # height above floor
     inc = (p[:, 0] > a.xmin) & (p[:, 0] < 4.0) & (np.abs(p[:, 1]) < a.halfwidth)
     c, hc = p[inc], h[inc]
-    out = dict(floor_ok=True, tilt=float(np.degrees(np.arctan(np.hypot(ca, cb)))),
+    out = dict(floor_ok=True, info=info,
+               tilt=float(np.degrees(np.arctan(np.hypot(ca, cb)))),
                clr=float(-cc), front=None, n=0, raw=None)
     low = c[hc > 0.05]
     if len(low):
@@ -126,8 +150,8 @@ def run_sensor(a):
                      history=HistoryPolicy.KEEP_LAST, depth=5)
     rng = np.random.default_rng(1)
     plane = {"coef": None, "t": 0.0}
-    st = dict(x=None, y=None, pose_t=0.0, floor_ok=False, tilt=None, clr=None,
-              front=None, n=0, raw=None, lidar_t=0.0, seq=0)
+    st = dict(x=None, y=None, pose_t=0.0, floor_ok=False, info="", tilt=None,
+              clr=None, front=None, n=0, raw=None, lidar_t=0.0, seq=0)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def on_pose(m):
@@ -230,7 +254,7 @@ def run_check(a, link):
         if m["floor_ok"]:
             fl = f"floor ok (LiDAR {m['clr']:.2f} m up, tilt {m['tilt']:.0f} deg)"
         else:
-            fl = "FLOOR NOT FOUND"
+            fl = f"FLOOR NOT FOUND ({m.get('info', '')})"
         print(f"pose x={m['x']:+.2f} y={m['y']:+.2f} (age {pa:.1f}s) | "
               f"lidar age {la:.1f}s | {fl} | obstacle: {fmt(m['front'])} "
               f"({m['n']} pts) | nearest bump: {fmt(m['raw'])}")
