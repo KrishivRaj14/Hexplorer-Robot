@@ -73,7 +73,7 @@ def fit_floor(p, rng, cell=0.25):
     inl = (dist < 0.04).sum(axis=0)
     inl[~good] = 0
     k = int(np.argmax(inl))
-    if inl[k] < max(12, int(0.4 * nq)):
+    if inl[k] < max(20, int(0.25 * nq)):
         return None, f"best plane fits only {int(inl[k])} of {nq} ground cells"
     m = dist[:, k] < 0.04
     for _ in range(3):
@@ -84,13 +84,16 @@ def fit_floor(p, rng, cell=0.25):
         if m.sum() < 12:
             return None, "plane fit collapsed"
     G = Q[m]
+    below = int((Q[:, 2] - (Q[:, 0] * coef[0] + Q[:, 1] * coef[1] + coef[2]) < -0.08).sum())
+    if below > max(5, 0.1 * nq):
+        return None, f"{below} ground cells lie below the best plane (not the floor)"
     near = G[np.hypot(G[:, 0], G[:, 1]) < 2.0]
     if len(near) < 8 or np.ptp(np.hypot(G[:, 0], G[:, 1])) < 0.8:
         return None, "no floor seen within 2 m"
     a, b, c = (float(v) for v in coef)
     if 1.0 / math.sqrt(1 + a * a + b * b) < 0.82 or not (-1.2 < c < -0.05):
         return None, f"implausible floor (LiDAR {-c:.2f} m up)"
-    return (a, b, c), f"{int(m.sum())} of {nq} ground cells"
+    return (a, b, c), f"{int(m.sum())} of {nq} ground cells, {below} below"
 
 
 def analyze(pts, a, rng, plane):
@@ -112,7 +115,7 @@ def analyze(pts, a, rng, plane):
     p = p[np.isfinite(p).all(axis=1) & np.any(p != 0, axis=1)]
     now = time.time()
     r = np.hypot(p[:, 0], p[:, 1])
-    coef, info = fit_floor(p[(r > a.xmin) & (r < 3.5)], rng)
+    coef, info = fit_floor(p[(p[:, 0] > a.xmin) & (r < 3.5)], rng)   # floor ahead only
     if coef is not None:
         plane["coef"], plane["t"] = coef, now
     elif plane["coef"] is None or now - plane["t"] > 1.0:
