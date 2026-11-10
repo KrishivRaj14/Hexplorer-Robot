@@ -5,11 +5,16 @@ stop early if the LiDAR sees something in front, then go into damping mode.
 Needs start_fastlio.sh running in another terminal (it provides
 /lidar_odometry/pose and /livox/lidar).
 
-  python3 ~/walk_safe.py --check     # sensors only, the robot does NOT move
-  python3 ~/walk_safe.py 2.0         # stand up, walk 2.0 m, go limp (damping)
-  python3 ~/walk_safe.py 2.0 --end sit   # same, but fold down gently at the end
+  python3 ~/walk_safe.py --check         # sensors only, the robot does NOT move
+  python3 ~/walk_safe.py 2.0             # stand up, walk 2.0 m, go limp (damping)
 
-Ctrl+C at any time: the robot stops walking and finishes the same way.
+However it ends (target reached, obstacle, Ctrl+C, a dropped SSH connection, an
+error), the robot stops walking and ends in damping mode.
+
+The LiDAR is tilted on the robot, so the floor is not at a fixed height in the
+LiDAR's view. Every frame the script finds the floor plane itself (RANSAC) and
+only counts points that stick up from it as obstacles. It ignores the robot's
+own body (closer than --xmin) and stops if it cannot see the floor.
 
 Why two processes: the sensors use cyclonedds, the robot controller uses
 fastrtps, and one ROS node cannot use both. A small helper process (cyclone)
@@ -28,36 +33,82 @@ import time
 
 import numpy as np
 
-INF = float("inf")
-
 
 # ---------------------------------------------------------------- geometry
-def corridor_stats(pts, xmin, xmax, halfw, zmin, zmax, min_pts=5):
-    """pts: Nx3+ array in the LiDAR frame (x forward, y left, z up).
+def fit_floor(p, rng, iters=150, thresh=0.03):
+    """Find the floor plane z = a*x + b*y + c in LiDAR coordinates.
 
-    Returns (front, n, raw, rawz):
-      front: distance (m, along x) to the nearest obstacle in the corridor
-             in front of the robot, or None if clear. Points must lie in the
-             height band zmin..zmax, and at least min_pts must be present.
-      n:     number of points in the corridor and height band.
-      raw:   nearest corridor point ignoring height (floor included), or None.
-      rawz:  height of that point, or None. Used only to diagnose floor leaks.
+    p: Nx3 candidate points. Returns (a, b, c) or None. The plane must be
+    within ~35 degrees of level (relative to the LiDAR) and between 5 cm and
+    1.2 m below the LiDAR, which rules out walls and the ceiling.
+    """
+    n = len(p)
+    if n < 400:
+        return None
+    idx = rng.integers(0, n, (iters, 3))
+    A, B, C = p[idx[:, 0]], p[idx[:, 1]], p[idx[:, 2]]
+    nr = np.cross(B - A, C - A).astype(np.float64)
+    ln = np.linalg.norm(nr, axis=1)
+    good = ln > 1e-4
+    nr = nr / np.where(good, ln, 1.0)[:, None]
+    nr[nr[:, 2] < 0] *= -1
+    d = -np.einsum("ij,ij->i", nr, A.astype(np.float64))
+    good &= nr[:, 2] > 0.82
+    good &= (d > 0.05 * nr[:, 2]) & (d < 1.2 * nr[:, 2])
+    if not good.any():
+        return None
+    dist = np.abs(p.astype(np.float64) @ nr.T + d)
+    inl = (dist < thresh).sum(axis=0)
+    inl[~good] = 0
+    k = int(np.argmax(inl))
+    if inl[k] < max(300, 0.10 * n):
+        return None
+    m = dist[:, k] < 2 * thresh
+    X = np.c_[p[m, 0], p[m, 1], np.ones(int(m.sum()))]
+    coef, *_ = np.linalg.lstsq(X, p[m, 2].astype(np.float64), rcond=None)
+    return float(coef[0]), float(coef[1]), float(coef[2])
+
+
+def analyze(pts, a, rng, plane):
+    """Look at one LiDAR frame.
+
+    Returns a dict:
+      floor_ok: the floor plane was found (or reused for up to 1 s)
+      tilt:     how far the floor is tilted in the LiDAR's view (degrees)
+      clr:      LiDAR height above the floor (m)
+      front:    distance ahead (m) of the nearest obstacle in the corridor in
+                front of the robot, or None. An obstacle is at least 5 points
+                between --zmin and --zmax above the floor.
+      n:        number of obstacle points in the corridor
+      raw:      nearest point >5 cm above the floor in the corridor (diagnostic)
+    plane: dict holding the last good floor fit; updated in place.
     """
     p = np.asarray(pts, dtype=np.float32)[:, :3]
-    ok = np.isfinite(p).all(axis=1) & np.any(p != 0, axis=1)
-    p = p[ok]
-    inc = (p[:, 0] > xmin) & (p[:, 0] < xmax) & (np.abs(p[:, 1]) < halfw)
-    c = p[inc]
-    if len(c) == 0:
-        return None, 0, None, None
-    i = int(np.argmin(c[:, 0]))
-    raw, rawz = float(c[i, 0]), float(c[i, 2])
-    f = c[(c[:, 2] > zmin) & (c[:, 2] < zmax)]
-    n = int(len(f))
-    if n < min_pts:
-        return None, n, raw, rawz
-    xs = np.sort(f[:, 0])
-    return float(xs[min_pts - 1]), n, raw, rawz  # 5th-nearest: ignores stray points
+    p = p[np.isfinite(p).all(axis=1) & np.any(p != 0, axis=1)]
+    now = time.time()
+    r = np.linalg.norm(p, axis=1)
+    cand = p[(r > a.xmin) & (r < 4.0)]
+    if len(cand) > 4000:
+        cand = cand[rng.choice(len(cand), 4000, replace=False)]
+    coef = fit_floor(cand, rng)
+    if coef is not None:
+        plane["coef"], plane["t"] = coef, now
+    elif plane["coef"] is None or now - plane["t"] > 1.0:
+        return dict(floor_ok=False, tilt=None, clr=None, front=None, n=0, raw=None)
+    ca, cb, cc = plane["coef"]
+    h = p[:, 2] - (ca * p[:, 0] + cb * p[:, 1] + cc)      # height above floor
+    inc = (p[:, 0] > a.xmin) & (p[:, 0] < 4.0) & (np.abs(p[:, 1]) < a.halfwidth)
+    c, hc = p[inc], h[inc]
+    out = dict(floor_ok=True, tilt=float(np.degrees(np.arctan(np.hypot(ca, cb)))),
+               clr=float(-cc), front=None, n=0, raw=None)
+    low = c[hc > 0.05]
+    if len(low):
+        out["raw"] = float(low[:, 0].min())
+    f = c[(hc > a.zmin) & (hc < a.zmax)]
+    out["n"] = int(len(f))
+    if len(f) >= 5:
+        out["front"] = float(np.sort(f[:, 0])[4])          # 5th nearest: ignores strays
+    return out
 
 
 # ------------------------------------------------------------ sensor helper
@@ -73,8 +124,10 @@ def run_sensor(a):
     node = Node("walk_safe_sensor")
     qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                      history=HistoryPolicy.KEEP_LAST, depth=5)
-    st = dict(x=None, y=None, pose_t=0.0, front=None, n=0, raw=None, rawz=None,
-              lidar_t=0.0, seq=0)
+    rng = np.random.default_rng(1)
+    plane = {"coef": None, "t": 0.0}
+    st = dict(x=None, y=None, pose_t=0.0, floor_ok=False, tilt=None, clr=None,
+              front=None, n=0, raw=None, lidar_t=0.0, seq=0)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def on_pose(m):
@@ -86,10 +139,10 @@ def run_sensor(a):
         step = max(m.point_step // 4, 3)
         buf = np.frombuffer(bytes(m.data), dtype=np.float32)
         buf = buf[: (len(buf) // step) * step].reshape(-1, step)
-        front, n, raw, rawz = corridor_stats(
-            buf, a.xmin, 4.0, a.halfwidth, a.zmin, a.zmax)
-        st.update(front=front, n=n, raw=raw, rawz=rawz,
-                  lidar_t=time.time(), seq=st["seq"] + 1)
+        res = analyze(buf, a, rng, plane)
+        st.update(res)
+        st["lidar_t"] = time.time()
+        st["seq"] += 1
 
     node.create_subscription(Odometry, "/lidar_odometry/pose", on_pose, qos)
     node.create_subscription(PointCloud2, "/livox/lidar", on_cloud, qos)
@@ -136,6 +189,18 @@ def sensors_ok(m, pose_max=0.6, lidar_max=1.0):
     return pa < pose_max and la < lidar_max
 
 
+def say(*args):
+    """print() that never raises (the terminal may be gone after an SSH drop)."""
+    try:
+        print(*args, flush=True)
+    except Exception:  # noqa
+        pass
+
+
+def stop_signal(signum, frame):
+    raise KeyboardInterrupt
+
+
 def fmt(v, unit="m"):
     return "none" if v is None else f"{v:.2f} {unit}"
 
@@ -152,9 +217,9 @@ def start_helper(a):
 # ------------------------------------------------------------------- check
 def run_check(a, link):
     print("CHECK MODE: the robot will not move. Ctrl+C to quit.")
-    print("Clear floor ahead should read 'obstacle: none'. Hold a box or your")
-    print("leg about 0.5-1 m in front of the robot: it should show a distance.")
-    print("'incl. floor' shows what the LiDAR sees ignoring height.\n")
+    print("With a clear floor ahead it should say 'obstacle: none'. Hold a box or")
+    print("your leg 0.5-1.5 m in front of the robot: it should show a distance.")
+    print("'floor' shows the LiDAR height above the floor and its tilt.\n")
     while True:
         time.sleep(0.5)
         m = link.get()
@@ -162,10 +227,13 @@ def run_check(a, link):
             print("waiting for sensor data (is start_fastlio.sh running?)")
             continue
         pa, la = ages(m)
-        rz = "" if m["rawz"] is None else f" at height {m['rawz']:+.2f} m"
+        if m["floor_ok"]:
+            fl = f"floor ok (LiDAR {m['clr']:.2f} m up, tilt {m['tilt']:.0f} deg)"
+        else:
+            fl = "FLOOR NOT FOUND"
         print(f"pose x={m['x']:+.2f} y={m['y']:+.2f} (age {pa:.1f}s) | "
-              f"lidar age {la:.1f}s | obstacle: {fmt(m['front'])} "
-              f"({m['n']} pts) | incl. floor: {fmt(m['raw'])}{rz}")
+              f"lidar age {la:.1f}s | {fl} | obstacle: {fmt(m['front'])} "
+              f"({m['n']} pts) | nearest bump: {fmt(m['raw'])}")
 
 
 # -------------------------------------------------------------------- walk
@@ -180,11 +248,13 @@ def run_walk(a, link):
     t0 = time.time()
     while time.time() - t0 < 10:
         time.sleep(0.2)
-        if sensors_ok(link.get()):
+        m = link.get()
+        if sensors_ok(m) and m["floor_ok"]:
             break
     else:
-        print("ERROR: no fresh LiDAR/pose data. Is start_fastlio.sh running "
-              "in another terminal and printing 'Relayed ... odom messages'?")
+        print("ERROR: no fresh LiDAR/pose data, or the floor cannot be found. "
+              "Is start_fastlio.sh running in another terminal and printing "
+              "'Relayed ... odom messages'? Try --check.")
         return 1
     m = link.get()
     if m["front"] is not None and m["front"] < a.stop:
@@ -229,7 +299,7 @@ def run_walk(a, link):
 
         timeout = a.distance / a.speed * 2.0 + 15.0
         t_start = time.time()
-        last_seq, blocked = -1, 0
+        last_seq, blocked, nofloor = -1, 0, 0
         last_print = 0.0
         while True:
             m = link.get()
@@ -240,10 +310,14 @@ def run_walk(a, link):
             moved = math.hypot(dx, dy)
             if m["seq"] != last_seq:                  # count each LiDAR frame once
                 last_seq = m["seq"]
-                if m["front"] is not None and m["front"] < a.stop:
+                nofloor = 0 if m["floor_ok"] else nofloor + 1
+                if m["floor_ok"] and m["front"] is not None and m["front"] < a.stop:
                     blocked += 1
                 else:
                     blocked = 0
+            if nofloor >= 8:
+                reason = "STOPPED: cannot see the floor"
+                break
             if blocked >= 2:
                 reason = f"STOPPED: obstacle {m['front']:.2f} m ahead"
                 break
@@ -265,23 +339,23 @@ def run_walk(a, link):
     except Exception as e:  # noqa
         reason = f"STOPPED: error {e}"
     finally:
-        signal.signal(signal.SIGINT, signal.SIG_IGN)  # finish stopping safely
+        # Nothing can interrupt the stop-and-damp sequence from here on.
+        for sg in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sg, signal.SIG_IGN)
         try:
-            hold(4, 1.5, 0.0)                         # stop walking
-            m = link.get()
-            if m and m["x"] is not None and x0 is not None:
-                moved = math.hypot(m["x"] - x0, m["y"] - y0)
-                lat = m["y"] - y0
-            print(f"\nResult: {reason}")
-            print(f"LiDAR says it moved {moved:.2f} m forward "
-                  f"({a.distance:.2f} m asked), sideways {lat:+.2f} m")
-            if standing and a.end == "sit":
-                print("Sitting down...")
-                for s in (3, 1, 0):
-                    hold(s, 2.0)
-            elif standing:
-                print("Damping mode (the robot goes limp)...")
-                hold(0, 2.0)
+            try:
+                hold(4, 1.0, 0.0)                     # stop walking
+                m = link.get()
+                if m and m["x"] is not None and x0 is not None:
+                    moved = math.hypot(m["x"] - x0, m["y"] - y0)
+                    lat = m["y"] - y0
+                say(f"\nResult: {reason}")
+                say(f"LiDAR says it moved {moved:.2f} m forward "
+                    f"({a.distance:.2f} m asked), sideways {lat:+.2f} m")
+            finally:
+                if standing:
+                    say("Damping mode (the robot goes limp)...")
+                    hold(0, 2.0)
         finally:
             node.destroy_node()
             rclpy.shutdown()
@@ -301,13 +375,13 @@ def main():
                     help="stop if an obstacle is nearer than this, in m ahead of the LiDAR")
     ap.add_argument("--lead", type=float, default=0.06,
                     help="stop this far early to allow for coasting")
-    ap.add_argument("--xmin", type=float, default=0.30)
+    ap.add_argument("--xmin", type=float, default=0.60,
+                    help="ignore everything closer than this (the robot's own body)")
     ap.add_argument("--halfwidth", type=float, default=0.40)
-    ap.add_argument("--zmin", type=float, default=-0.25,
-                    help="lowest obstacle height, relative to the LiDAR")
-    ap.add_argument("--zmax", type=float, default=0.80)
-    ap.add_argument("--end", choices=["damping", "sit"], default="damping",
-                    help="how to finish: damping (go limp) or sit (fold down first)")
+    ap.add_argument("--zmin", type=float, default=0.10,
+                    help="smallest obstacle height ABOVE THE FLOOR")
+    ap.add_argument("--zmax", type=float, default=1.00,
+                    help="tallest obstacle height above the floor")
     ap.add_argument("--port", type=int, default=45678)
     ap.add_argument("--sensor-rmw", default="rmw_cyclonedds_cpp")
     a = ap.parse_args()
@@ -322,6 +396,8 @@ def main():
             ap.error("distance must be 0.2 to 5.0 m for now")
         a.speed = max(0.05, min(a.speed, 0.25))
 
+    signal.signal(signal.SIGTERM, stop_signal)   # kill / service stop
+    signal.signal(signal.SIGHUP, stop_signal)    # SSH connection dropped
     link = Link(a.port)
     helper = start_helper(a)
     try:
