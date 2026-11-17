@@ -154,12 +154,13 @@ def lidar_analyze(pts, a, rng, plane, keep=None):
     coef, info = fit_floor(p[(p[:, 0] > a.xmin) & (r < 3.5)], rng)
     if coef is not None:
         plane["coef"], plane["t"] = coef, now
-    elif plane["coef"] is None or now - plane["t"] > a.floor_hold:
-        # (the LiDAR is bolted to the robot, so the floor stays where it was
-        #  relative to it: keep the last good floor for --floor-hold seconds
-        #  when too little floor is in view, e.g. facing furniture)
+    elif plane["coef"] is None:
+        # The floor is learned once and then kept: the LiDAR is bolted to the
+        # robot and the house floor is flat, so it does not move relative to
+        # the LiDAR. A frame showing too little floor (facing furniture) just
+        # keeps the floor it already knows.
         return dict(l_ok=False, l_info=info, l_front=None, l_side=0,
-                    l_open_l=None, l_open_r=None)
+                    l_open_l=None, l_open_r=None, l_fit_t=0.0)
     ca, cb, cc = plane["coef"]
     h = p[:, 2] - (ca * p[:, 0] + cb * p[:, 1] + cc)
     own = (np.abs(p[:, 1]) < SELF_HALF_WIDTH) & (p[:, 0] > -SELF_BACK) & (p[:, 0] < a.xmin)
@@ -168,7 +169,7 @@ def lidar_analyze(pts, a, rng, plane, keep=None):
     obst = p[(h > a.zmin) & (h < a.zmax) & ~own & (r > 0.15)]
     if keep is not None:
         keep["obst"] = obst[np.hypot(obst[:, 0], obst[:, 1]) < 2.5, :2]
-    out = dict(l_ok=True, l_info=info, l_front=None, l_side=0)
+    out = dict(l_ok=True, l_info=info, l_front=None, l_side=0, l_fit_t=plane["t"])
     path = obst[(obst[:, 0] > 0) & (obst[:, 0] < 4.0) & (np.abs(obst[:, 1]) < PATH_HALF)]
     out["l_front"] = nth(path[:, 0])
     if out["l_front"] is not None:
@@ -336,7 +337,7 @@ def merge(m, use_cam, cam_max_age=3.0):
     if not lidar_ok:
         if now - m["lidar_t"] >= 1.0:
             return None, 0, "LiDAR data stopped arriving"
-        return None, 0, f"floor not found ({m.get('l_info', '')})"
+        return None, 0, f"floor never found yet ({m.get('l_info', '')})"
     if use_cam and not cam_ok:
         return None, 0, "camera lost"
     ld = m["l_front"] if m["l_front"] is not None else 9.0
@@ -365,7 +366,7 @@ def run_sensor(a):
     rng = np.random.default_rng(1)
     plane = {"coef": None, "t": 0.0}
     mem = ObstacleMemory()
-    st = dict(x=None, y=None, yaw=None, pose_t=0.0, lidar_t=0.0, seq=0, l_mem=False, tb=0,
+    st = dict(x=None, y=None, yaw=None, pose_t=0.0, lidar_t=0.0, seq=0, l_mem=False, tb=0, l_fit_t=0.0,
               near_l=0, near_r=0, tb_l=0, tb_r=0, room_l=0, room_r=0,
               l_ok=False, l_info="", l_front=None, l_side=0, l_open_l=None,
               l_open_r=None, cam_t=0.0, cam_n=0, c_front=None, c_side=0,
@@ -713,6 +714,16 @@ def wander_loop(a, link, send, hold, use_cam, node=None, rclpy=None):
         standing = True
         for s in (1, 2, 3):
             hold(s, 2.0)
+        # Standing raises the LiDAR ~20 cm: learn the floor again from this height.
+        t_stood, t_wait = time.time(), time.time() + 10.0
+        while True:
+            m = link.get()
+            if m and m.get("l_fit_t", 0.0) > t_stood:
+                break
+            if time.time() > t_wait:
+                raise RuntimeError("could not see the floor after standing up; "
+                                   "start with open floor in front of the robot")
+            hold(3, 0.2)
         brain = Brain(a)
         t_end = time.time() + a.minutes * 60
         last_print = 0.0
@@ -786,8 +797,6 @@ def main():
     ap.add_argument("--side-max", type=float, default=0.35, help="most it side-steps (m)")
     ap.add_argument("--clear-frames", type=int, default=4)
     ap.add_argument("--xmin", type=float, default=0.60)
-    ap.add_argument("--floor-hold", type=float, default=10.0,
-                    help="seconds to keep using the last floor when too little floor is in view")
     ap.add_argument("--zmin", type=float, default=0.10)
     ap.add_argument("--zmax", type=float, default=1.00)
     ap.add_argument("--port", type=int, default=45680)
@@ -808,8 +817,7 @@ def main():
     env = dict(os.environ, RMW_IMPLEMENTATION=a.sensor_rmw)
     helper = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--sensor", "--port", str(a.port),
-         "--xmin", str(a.xmin), "--zmin", str(a.zmin), "--zmax", str(a.zmax),
-         "--floor-hold", str(a.floor_hold)], env=env)
+         "--xmin", str(a.xmin), "--zmin", str(a.zmin), "--zmax", str(a.zmax)], env=env)
     try:
         return run_check(a, link) if a.check else run_wander(a, link)
     except KeyboardInterrupt:
