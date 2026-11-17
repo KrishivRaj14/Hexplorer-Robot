@@ -8,6 +8,7 @@ Needs, in other terminals:
   depth_bridge_receiver.py               (mini PC, RMW cyclone)
 
   python3 ~/wander.py --check            # sensors only, the robot does NOT move
+  python3 ~/wander.py --check --stand    # stands up (does NOT walk), sensors at walking height
   python3 ~/wander.py                    # wander for up to 3 minutes
   python3 ~/wander.py --minutes 5
   python3 ~/wander.py --no-camera        # LiDAR only
@@ -991,16 +992,83 @@ class Brain:
 
 # ---------------------------------------------------------------- check
 def run_check(a, link):
+    if a.stand:
+        return run_check_standing(a, link)
     print("CHECK MODE: the robot will not move. Ctrl+C to quit.")
+    print_check_header(a)
+    while True:
+        time.sleep(0.5)
+        print_check_line(a, link)
+
+
+def print_check_header(a):
     print("LiDAR and camera each give: nearest obstacle in the robot's path, and which side.")
     print("'merged' is what the robot would act on; it stops below "
           f"{a.stop} m and slows below {a.slow} m.\n")
-    while True:
-        time.sleep(0.5)
+
+
+def run_check_standing(a, link):
+    """--check --stand: stand up and hold still (no walking) while printing the
+    check lines, so the sensors are seen at walking height. Ctrl+C: lie down,
+    then damping (same safe ending as wander)."""
+    import rclpy
+    from rclpy.node import Node
+    from geometry_msgs.msg import Twist
+    from custom_msg.msg import RobotCommand
+
+    ros_init(rclpy)
+    node = Node("wander_check")
+    cmd_pub = node.create_publisher(RobotCommand, "/robot_cmd", 10)
+    vel_pub = node.create_publisher(Twist, "/vel_cmd", 10)
+
+    def send(state):
+        c = RobotCommand()
+        c.header.stamp = node.get_clock().now().to_msg()
+        c.target_state = state
+        cmd_pub.publish(c)
+        vel_pub.publish(Twist())              # zero velocity: it never walks
+
+    def hold(state, seconds):
+        for _ in range(int(seconds * 20)):
+            send(state)
+            time.sleep(0.05)
+
+    try:
+        print("CHECK MODE, STANDING: the robot stands up but does NOT walk. "
+              "Ctrl+C to lie down.")
+        print("Standing up (about 6 s)...")
+        for s_ in (1, 2, 3):
+            hold(s_, 2.0)
+        write_state(f"standing {time.time()}")
+        print_check_header(a)
+        t_end = time.time() + 600                 # at most 10 minutes
+        while time.time() < t_end:
+            hold(3, 0.5)                          # keep it standing still
+            print_check_line(a, link)
+        print("10 minutes up.")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        for sg in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sg, signal.SIG_IGN)
+        try:
+            write_state("lying")
+            say("\nLying down, then damping mode...")
+            hold(3, 1.0)
+            hold(1, 2.0)
+            hold(0, 2.0)
+        finally:
+            node.destroy_node()
+            rclpy.try_shutdown()
+    return 0
+
+
+def print_check_line(a, link):
+    if True:
         m = link.get()
         if not m or m["x"] is None:
             print("waiting for pose (is start_fastlio.sh running?)")
-            continue
+            return
         now = time.time()
         d, side, src = merge(m, not a.no_camera)
         lid = (f"LiDAR {f(m['l_front'])}{'(mem)' if m.get('l_mem') else '     '} {side_word(m['l_side']):6s}" if m["l_ok"]
@@ -1136,6 +1204,8 @@ def wander_loop(a, link, send, hold, use_cam, node=None, rclpy=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="sensors only, no movement")
+    ap.add_argument("--stand", action="store_true",
+                    help="with --check: stand up (but do not walk) while checking")
     ap.add_argument("--sensor", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--minutes", type=float, default=3.0)
     ap.add_argument("--no-camera", action="store_true", help="LiDAR only")
