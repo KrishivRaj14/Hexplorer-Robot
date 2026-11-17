@@ -179,8 +179,12 @@ def lidar_analyze(pts, a, rng, plane, keep=None):
     obst = p[(h > lo) & (h < hi) & ~own & (r > 0.15)]
     if keep is not None:
         keep["obst"] = obst[np.hypot(obst[:, 0], obst[:, 1]) < 2.5, :2]
+        if "view" in keep:
+            keep["all"], keep["band"] = p[:, :2], obst[:, :2]
     out = dict(l_ok=True, l_info=info, l_front=None, l_side=0, l_fit_t=plane["t"])
     path = obst[(obst[:, 0] > 0) & (obst[:, 0] < 4.0) & (np.abs(obst[:, 1]) < PATH_HALF)]
+    if keep is not None and "view" in keep:
+        keep["path"] = path[:, :2]
     out["l_front"] = nth(path[:, 0])
     if out["l_front"] is not None:
         close = path[path[:, 0] < out["l_front"] + 0.3]
@@ -406,6 +410,257 @@ def save_floor(coef):
         pass
 
 
+# ---------------------------------------------------------------- live view
+# A small web page served by the sensor helper: open http://192.168.1.10:8080
+# on the laptop. Top-down LiDAR map, camera picture with the 8 strips, what
+# each sensor says, the merged decision, and a frozen snapshot of the last stop.
+
+def png_bytes(img):
+    """uint8 array (h, w) or (h, w, 3) -> PNG file bytes (no extra libraries)."""
+    import struct
+    import zlib
+    img = np.ascontiguousarray(img, dtype=np.uint8)
+    h, w = img.shape[:2]
+    ctype = 2 if img.ndim == 3 else 0
+    raw = b"".join(b"\x00" + img[r].tobytes() for r in range(h))
+
+    def chunk(tag, data):
+        c = struct.pack(">I", len(data)) + tag + data
+        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, ctype, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 1)) + chunk(b"IEND", b""))
+
+
+def strip_angles(width=640):
+    edges = np.linspace(0, CAM_X1 - CAM_X0, STRIPS + 1)
+    return [math.atan((width / 2.0 - (CAM_X0 + (edges[k] + edges[k + 1]) / 2.0)) / FX)
+            for k in range(STRIPS)]
+
+
+def view_info(st, a, use_cam):
+    """What each sensor says and what the robot would do, for the page."""
+    now = time.time()
+    d, side, src = merge(st, use_cam)
+    if d is None:
+        act = "STOP (" + src + ")"
+    else:
+        act = ("STOP + TURN" if d < a.stop else "SLOW" if d < a.slow else "GO")
+    cam_yaw, yaw = st.get("cam_yaw"), st.get("yaw")
+    fresh_dir = (cam_yaw is not None and yaw is not None
+                 and abs(wrap(yaw - cam_yaw)) < math.radians(10))
+    inpath = [v is not None and abs(v * math.tan(an)) < PATH_HALF
+              for v, an in zip(st["c_strips"], strip_angles())]
+    return dict(t=now, action=act, merged=d, merged_src=src, merged_side=side_word(side),
+                l_front=st["l_front"], l_side=side_word(st["l_side"]), l_mem=st["l_mem"],
+                l_info=st["l_info"], c_front=st["c_front"], c_side=side_word(st["c_side"]),
+                cam_age=now - st["cam_t"] if st["cam_t"] else None, cam_dir_ok=fresh_dir,
+                c_strips=st["c_strips"], c_inpath=inpath,
+                tb=st["tb"], near_l=st["near_l"], near_r=st["near_r"],
+                stop=a.stop, slow=a.slow)
+
+
+def view_svg(snap, a):
+    """Top-down picture around the robot (LiDAR frame): forward is up, left is left."""
+    W = H = 500
+    k = 100.0                                    # pixels per metre
+
+    def X(y):
+        return (2.5 - y) * k
+
+    def Y(x):
+        return (3.5 - x) * k
+
+    def dots(xy, size):
+        if xy is None or len(xy) == 0:
+            return ""
+        xy = xy[(xy[:, 0] > -1.5) & (xy[:, 0] < 3.5) & (np.abs(xy[:, 1]) < 2.5)]
+        return "".join(f"M{X(py):.0f} {Y(px):.0f}h{size}v{size}h-{size}z" for px, py in xy)
+
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+           f'viewBox="0 0 {W} {H}" font-family="sans-serif" font-size="12">',
+           f'<rect width="{W}" height="{H}" fill="#fafafa"/>']
+    for m in range(-1, 4):
+        out.append(f'<line x1="0" y1="{Y(m):.0f}" x2="{W}" y2="{Y(m):.0f}" stroke="#e4e4e4"/>'
+                   f'<text x="3" y="{Y(m) - 3:.0f}" fill="#999">{m} m</text>')
+    allp = snap.get("all")
+    if allp is not None and len(allp) > 3000:
+        allp = allp[:: max(1, len(allp) // 3000)]
+    out.append(f'<path d="{dots(allp, 2)}" fill="#c8c8c8"/>')
+    out.append(f'<path d="{dots(snap.get("band"), 3)}" fill="#f0a030"/>')
+    for (cx, cy) in snap.get("mem", []):
+        out.append(f'<rect x="{X(cy + 0.05):.0f}" y="{Y(cx + 0.05):.0f}" width="10" height="10" '
+                   f'fill="none" stroke="#3060d0" stroke-width="1.5"/>')
+    out.append(f'<path d="{dots(snap.get("path"), 4)}" fill="#e02020"/>')
+    # robot body, turn circle, path, stop/slow lines
+    bx0, bx1 = -LIDAR_AHEAD - ROBOT_HALF_LENGTH, -LIDAR_AHEAD + ROBOT_HALF_LENGTH
+    out.append(f'<rect x="{X(ROBOT_HALF_WIDTH):.0f}" y="{Y(bx1):.0f}" width="{2 * ROBOT_HALF_WIDTH * k:.0f}" '
+               f'height="{(bx1 - bx0) * k:.0f}" fill="#4a7bd8" fill-opacity="0.35" stroke="#2a4b98"/>')
+    out.append(f'<circle cx="{X(0):.0f}" cy="{Y(-LIDAR_AHEAD):.0f}" r="{TURN_RADIUS * k:.0f}" '
+               f'fill="none" stroke="#2a4b98" stroke-dasharray="3 3"/>')
+    out.append(f'<circle cx="{X(0):.0f}" cy="{Y(0):.0f}" r="4" fill="#000"/>')
+    for yy in (PATH_HALF, -PATH_HALF):
+        out.append(f'<line x1="{X(yy):.0f}" y1="{Y(0):.0f}" x2="{X(yy):.0f}" y2="{Y(3.5):.0f}" '
+                   f'stroke="#888" stroke-dasharray="6 4"/>')
+    for dist, col, lab in ((a.stop, "#e02020", "stop"), (a.slow, "#f0a030", "slow")):
+        out.append(f'<line x1="{X(PATH_HALF):.0f}" y1="{Y(dist):.0f}" x2="{X(-PATH_HALF):.0f}" '
+                   f'y2="{Y(dist):.0f}" stroke="{col}" stroke-width="2"/>'
+                   f'<text x="{X(-PATH_HALF) + 4:.0f}" y="{Y(dist) + 4:.0f}" fill="{col}">{lab} {dist:.1f} m</text>')
+    # camera strip readings (green; filled = inside the robot's path)
+    info = snap.get("info", {})
+    for v, an, inp in zip(info.get("c_strips", []), strip_angles(), info.get("c_inpath", [])):
+        if v is not None:
+            out.append(f'<circle cx="{X(v * math.tan(an)):.0f}" cy="{Y(v):.0f}" r="6" '
+                       f'fill="{"#20a040" if inp else "none"}" stroke="#20a040" stroke-width="2"/>')
+    out.append(f'<text x="8" y="{H - 10}" font-size="18" font-weight="bold" fill="#222">'
+               f'{info.get("action", "")}</text>')
+    out.append('</svg>')
+    return "".join(out)
+
+
+VIEW_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Hexplorer live view</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font-family:sans-serif;margin:12px;background:#fff;color:#222}
+.row{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
+.cam{position:relative;width:320px;height:240px;background:#333}
+.cam img{width:320px;height:240px;display:block}
+.strip{position:absolute;top:40px;height:110px;border:1px solid rgba(255,255,255,.5);
+ color:#fff;font-size:11px;text-align:center;box-sizing:border-box;text-shadow:0 0 3px #000}
+.strip.inpath{border:2px solid #20d060}.strip.close{background:rgba(255,0,0,.35)}
+table{border-collapse:collapse;font-size:14px}td{padding:2px 10px 2px 0}
+h2{font-size:16px;margin:18px 0 6px}.big{font-size:22px;font-weight:bold}
+.key span{display:inline-block;width:10px;height:10px;margin:0 4px 0 12px}</style></head><body>
+<div class="big" id="act">connecting...</div>
+<label><input type="checkbox" id="pause"> pause</label>
+<div class="row">
+ <div><img id="scene" width="500" height="500">
+  <div class="key"><span style="background:#c8c8c8"></span>all LiDAR points
+  <span style="background:#f0a030"></span>counted as obstacle (LiDAR)
+  <span style="background:#e02020"></span>obstacle in the path<br>
+  <span style="border:2px solid #3060d0"></span>remembered
+  <span style="background:#20a040;border-radius:5px"></span>camera strip (filled = in path)
+  <span style="background:#4a7bd8"></span>robot, dashed circle = turn room</div></div>
+ <div><div class="cam" id="cam"><img id="camimg"></div>
+  <table id="info"></table></div>
+</div>
+<h2 id="stoph">Last stop: none yet</h2>
+<div class="row"><img id="sscene" width="500" height="500" style="display:none">
+ <div><div class="cam" id="scam" style="display:none"><img id="scamimg"></div><table id="sinfo"></table></div></div>
+<script>
+function f(v){return v===null||v===undefined?"--":(typeof v==="number"?v.toFixed(2):v)}
+function table(el,d){el.innerHTML=
+ "<tr><td><b>LiDAR</b></td><td>"+f(d.l_front)+" m "+d.l_side+(d.l_mem?" (from memory)":"")+"</td></tr>"+
+ "<tr><td><b>camera</b></td><td>"+f(d.c_front)+" m "+d.c_side+", picture "+f(d.cam_age)+" s old"+
+   (d.cam_dir_ok?"":" (IGNORED: taken before a turn)")+"</td></tr>"+
+ "<tr><td><b>merged</b></td><td>"+f(d.merged)+" m via "+d.merged_src+", obstacle side "+d.merged_side+"</td></tr>"+
+ "<tr><td><b>decision</b></td><td>"+d.action+"</td></tr>"+
+ "<tr><td>turn room</td><td>"+(d.tb>=2?"TOO CLOSE TO TURN":"ok")+" (near L "+d.near_l+", R "+d.near_r+")</td></tr>"+
+ "<tr><td>LiDAR mode</td><td>"+d.l_info+"</td></tr>"}
+function strips(el,d){el.querySelectorAll(".strip").forEach(e=>e.remove());
+ for(let i=0;i<8;i++){const s=document.createElement("div");const v=d.c_strips[i];
+  s.className="strip"+(d.c_inpath[i]?" inpath":"")+(d.c_inpath[i]&&v!==null&&v<d.stop?" close":"");
+  s.style.left=(10+i*37.5)+"px";s.style.width="37.5px";s.textContent=f(v);el.appendChild(s)}}
+let lastStop=0;
+async function tick(){if(document.getElementById("pause").checked)return;const t=Date.now();
+ try{const d=await (await fetch("info.json?"+t)).json();
+  document.getElementById("act").textContent=d.action;table(document.getElementById("info"),d);
+  strips(document.getElementById("cam"),d);
+  document.getElementById("scene").src="scene.svg?"+t;document.getElementById("camimg").src="cam.png?"+t;
+  const s=await (await fetch("stop.json?"+t)).json();
+  if(s.t&&s.t!==lastStop){lastStop=s.t;
+   document.getElementById("stoph").textContent="Last stop: "+new Date(s.t*1000).toLocaleTimeString()+" - "+s.action;
+   table(document.getElementById("sinfo"),s);strips(document.getElementById("scam"),s);
+   for(const id of ["sscene","scam"])document.getElementById(id).style.display="";
+   document.getElementById("sscene").src="stop.svg?"+t;document.getElementById("scamimg").src="stop.png?"+t}
+ }catch(e){document.getElementById("act").textContent="no connection to the robot"}}
+setInterval(tick,500);tick();
+</script></body></html>"""
+
+
+class LiveView:
+    """Holds the latest data (and a copy at the last stop) and serves the page."""
+
+    def __init__(self, a):
+        import threading
+        self.a, self.lock = a, threading.Lock()
+        self.live, self.stop_snap, self.was_stop = {}, None, False
+        self.cam_img = None
+        self.ok = False
+        try:
+            self._serve(a.view_port)
+            self.ok = True
+        except OSError as e:
+            print(f"[live view] could not open port {a.view_port}: {e}", flush=True)
+
+    def update(self, snap):
+        with self.lock:
+            snap["cam"] = self.cam_img
+            self.live = snap
+            stop_now = snap["info"]["action"].startswith("STOP")
+            if stop_now and not self.was_stop:
+                self.stop_snap = dict(snap)            # freeze this moment
+            self.was_stop = stop_now
+
+    def set_cam(self, img):
+        with self.lock:
+            self.cam_img = img
+
+    def _get(self, which):
+        with self.lock:
+            return self.live if which == "live" else self.stop_snap
+
+    def _serve(self, port):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        view = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, body, ctype):
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                path = self.path.split("?")[0].lstrip("/")
+                try:
+                    if path in ("", "index.html"):
+                        return self._send(VIEW_HTML.encode(), "text/html; charset=utf-8")
+                    which = "stop" if path.startswith("stop") else "live"
+                    snap = view._get(which) or {}
+                    if path.endswith(".json"):
+                        return self._send(json.dumps(snap.get("info", {})).encode(), "application/json")
+                    if path.endswith(".svg"):
+                        return self._send(view_svg(snap, view.a).encode(), "image/svg+xml")
+                    if path.endswith(".png"):
+                        img = snap.get("cam")
+                        if img is None:
+                            img = np.full((240, 320), 60, np.uint8)
+                        return self._send(png_bytes(img), "image/png")
+                    self.send_error(404)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        srv = ThreadingHTTPServer(("0.0.0.0", port), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
+def robot_frame_cells(mem, x, y, yaw):
+    """Remembered squares, as centres in LiDAR coordinates (for the view)."""
+    if not mem.cells or yaw is None:
+        return []
+    k = np.array(list(mem.cells.keys()), dtype=np.float64)
+    wx, wy = (k[:, 0] + 0.5) * mem.cell - x, (k[:, 1] + 0.5) * mem.cell - y
+    c, s = math.cos(yaw), math.sin(yaw)
+    rx, ry = c * wx + s * wy, -s * wx + c * wy
+    sel = (rx > -1.5) & (rx < 3.5) & (np.abs(ry) < 2.5)
+    return list(zip(rx[sel].tolist(), ry[sel].tolist()))
+
+
 def run_sensor(a):
     import rclpy
     from rclpy.node import Node
@@ -427,6 +682,10 @@ def run_sensor(a):
               l_open_r=None, cam_t=0.0, cam_n=0, cam_yaw=None, c_front=None, c_side=0,
               c_strips=[None] * STRIPS)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    view = LiveView(a) if a.view_port else None
+    if view is not None and not view.ok:
+        view = None
+    use_cam = not a.no_camera
 
     def on_pose(m):
         q = m.pose.pose.orientation
@@ -449,7 +708,7 @@ def run_sensor(a):
         if (a.floor_mode and since is not None and plane["t"] < since and now - since > 1.5
                 and fstate["saved"] is not None):
             plane["coef"], plane["t"], plane["src"] = fstate["saved"], now, "saved"
-        keep = {}
+        keep = {"view": True} if view is not None else {}
         t_before = plane["t"]
         res = lidar_analyze(buf, a, rng, plane, keep)
         if (a.floor_mode and since is not None and plane.get("src") == "fit" and plane["t"] != t_before
@@ -471,6 +730,13 @@ def run_sensor(a):
         st.update(res)
         st["lidar_t"] = now
         st["seq"] += 1
+        if view is not None:
+            try:
+                view.update(dict(info=view_info(st, a, use_cam), all=keep.get("all"),
+                                 band=keep.get("band"), path=keep.get("path"),
+                                 mem=robot_frame_cells(mem, st["x"], st["y"], st["yaw"])))
+            except Exception as e:  # noqa  (the view must never stop the robot)
+                print(f"[live view] {e}", flush=True)
 
     def on_depth(m):
         d = np.frombuffer(bytes(m.data), dtype=np.uint16).reshape(m.height, m.width)
@@ -482,6 +748,19 @@ def run_sensor(a):
     node.create_subscription(Odometry, "/lidar_odometry/pose", on_pose, qos)
     node.create_subscription(PointCloud2, "/livox/lidar", on_cloud, qos)
     node.create_subscription(Image, "/camera/depth/image_raw", on_depth, qos)
+
+    def on_color(m):
+        try:
+            img = np.frombuffer(bytes(m.data), dtype=np.uint8).reshape(m.height, m.width, -1)
+            img = img[::2, ::2, :3]
+            if m.encoding.lower().startswith("bgr"):
+                img = img[:, :, ::-1]
+            view.set_cam(np.ascontiguousarray(img))
+        except Exception:  # noqa
+            pass
+
+    if view is not None:
+        node.create_subscription(Image, "/camera/color/image_raw", on_color, qos)
     node.create_timer(0.05, lambda: sock.sendto(json.dumps(st).encode(),
                                                 ("127.0.0.1", a.port)))
     try:
@@ -887,6 +1166,8 @@ def main():
     ap.add_argument("--zmin", type=float, default=0.10)
     ap.add_argument("--zmax", type=float, default=1.00)
     ap.add_argument("--port", type=int, default=45680)
+    ap.add_argument("--view-port", type=int, default=8080,
+                    help="live view in the laptop's browser: http://192.168.1.10:8080 (0 = off)")
     ap.add_argument("--sensor-rmw", default="rmw_cyclonedds_cpp")
     a = ap.parse_args()
     global TURN_RADIUS
@@ -909,7 +1190,12 @@ def main():
         [sys.executable, os.path.abspath(__file__), "--sensor", "--port", str(a.port),
          "--xmin", str(a.xmin), "--zmin", str(a.zmin), "--zmax", str(a.zmax),
          "--band-lo", str(a.band_lo), "--band-hi", str(a.band_hi),
-         "--turn-room", str(a.turn_room)] + (["--floor-mode"] if a.floor_mode else []), env=env)
+         "--turn-room", str(a.turn_room), "--stop", str(a.stop), "--slow", str(a.slow),
+         "--view-port", str(a.view_port)]
+        + (["--floor-mode"] if a.floor_mode else []) + (["--no-camera"] if a.no_camera else []),
+        env=env)
+    if a.view_port:
+        print(f"Live view: on the laptop, open  http://192.168.1.10:{a.view_port}  in a browser")
     try:
         return run_check(a, link) if a.check else run_wander(a, link)
     except KeyboardInterrupt:
