@@ -153,7 +153,7 @@ def lidar_analyze(pts, a, rng, plane, keep=None):
     r = np.hypot(p[:, 0], p[:, 1])
     coef, info = fit_floor(p[(p[:, 0] > a.xmin) & (r < 3.5)], rng)
     if coef is not None:
-        plane["coef"], plane["t"] = coef, now
+        plane["coef"], plane["t"], plane["src"] = coef, now, "fit"
     elif plane["coef"] is None:
         # The floor is learned once and then kept: the LiDAR is bolted to the
         # robot and the house floor is flat, so it does not move relative to
@@ -352,6 +352,44 @@ def merge(m, use_cam, cam_max_age=3.0):
 
 
 # ---------------------------------------------------------------- sensor helper
+FLOOR_FILE = os.path.expanduser("~/.wander_floor.json")   # floor as seen while standing
+STATE_FILE = os.path.expanduser("~/.wander_state")        # "standing <time>" or "lying"
+
+
+def read_state():
+    try:
+        with open(STATE_FILE) as fh:
+            w = fh.read().split()
+        return float(w[1]) if w and w[0] == "standing" else None
+    except Exception:  # noqa
+        return None
+
+
+def write_state(text):
+    try:
+        with open(STATE_FILE, "w") as fh:
+            fh.write(text)
+    except Exception:  # noqa
+        pass
+
+
+def load_floor():
+    try:
+        with open(FLOOR_FILE) as fh:
+            c = json.load(fh)["coef"]
+        return tuple(float(v) for v in c)
+    except Exception:  # noqa
+        return None
+
+
+def save_floor(coef):
+    try:
+        with open(FLOOR_FILE, "w") as fh:
+            json.dump({"coef": list(coef), "saved": time.time()}, fh)
+    except Exception:  # noqa
+        pass
+
+
 def run_sensor(a):
     import rclpy
     from rclpy.node import Node
@@ -364,7 +402,8 @@ def run_sensor(a):
     qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                      history=HistoryPolicy.KEEP_LAST, depth=2)
     rng = np.random.default_rng(1)
-    plane = {"coef": None, "t": 0.0}
+    plane = {"coef": None, "t": 0.0, "src": None}
+    fstate = {"checked": 0.0, "since": None, "saved": load_floor(), "saved_t": 0.0}
     mem = ObstacleMemory()
     st = dict(x=None, y=None, yaw=None, pose_t=0.0, lidar_t=0.0, seq=0, l_mem=False, tb=0, l_fit_t=0.0,
               near_l=0, near_r=0, tb_l=0, tb_r=0, room_l=0, room_r=0,
@@ -384,9 +423,25 @@ def run_sensor(a):
         step = max(m.point_step // 4, 3)
         buf = np.frombuffer(bytes(m.data), dtype=np.float32)
         buf = buf[: (len(buf) // step) * step].reshape(-1, step)
-        keep = {}
-        res = lidar_analyze(buf, a, rng, plane, keep)
         now = time.time()
+        # Floor while standing: the robot's own standing floor never changes,
+        # so it is saved to a file the first time it is seen and reused when a
+        # run starts somewhere with no floor in view (e.g. facing a door).
+        if now - fstate["checked"] > 0.5:
+            fstate["checked"], fstate["since"] = now, read_state()
+        since = fstate["since"]
+        if (since is not None and plane["t"] < since and now - since > 1.5
+                and fstate["saved"] is not None):
+            plane["coef"], plane["t"], plane["src"] = fstate["saved"], now, "saved"
+        keep = {}
+        t_before = plane["t"]
+        res = lidar_analyze(buf, a, rng, plane, keep)
+        if (since is not None and plane.get("src") == "fit" and plane["t"] != t_before
+                and now - since > 1.0 and now - fstate["saved_t"] > 10.0):
+            save_floor(plane["coef"])
+            fstate["saved"], fstate["saved_t"] = plane["coef"], now
+        if plane.get("src") == "saved":
+            res["l_info"] = "using the saved standing floor"
         res["l_mem"] = False
         if res["l_ok"] and st["yaw"] is not None and now - st["pose_t"] < 0.6:
             mem.add(keep.get("obst", np.zeros((0, 2))), st["x"], st["y"], st["yaw"], now)
@@ -716,13 +771,16 @@ def wander_loop(a, link, send, hold, use_cam, node=None, rclpy=None):
             hold(s, 2.0)
         # Standing raises the LiDAR ~20 cm: learn the floor again from this height.
         t_stood, t_wait = time.time(), time.time() + 10.0
+        write_state(f"standing {t_stood}")
         while True:
             m = link.get()
             if m and m.get("l_fit_t", 0.0) > t_stood:
+                say(f"Floor: {m.get('l_info', '')}")
                 break
             if time.time() > t_wait:
-                raise RuntimeError("could not see the floor after standing up; "
-                                   "start with open floor in front of the robot")
+                raise RuntimeError("could not see the floor after standing up, and no "
+                                   "floor has been saved yet. For this first run, start "
+                                   "with about 1.5 m of open floor in front of the robot")
             hold(3, 0.2)
         brain = Brain(a)
         t_end = time.time() + a.minutes * 60
@@ -762,6 +820,7 @@ def wander_loop(a, link, send, hold, use_cam, node=None, rclpy=None):
                     say(f"Ended {math.hypot(m['x'] - x0[0], m['y'] - x0[1]):.2f} m "
                         f"from where it started (LiDAR).")
             finally:
+                write_state("lying")
                 if standing:
                     say("Lying down, then damping mode...")
                     hold(3, 1.0)
@@ -813,6 +872,7 @@ def main():
 
     signal.signal(signal.SIGTERM, stop_signal)
     signal.signal(signal.SIGHUP, stop_signal)
+    write_state("lying")                 # the robot is not standing until we stand it up
     link = Link(a.port)
     env = dict(os.environ, RMW_IMPLEMENTATION=a.sensor_rmw)
     helper = subprocess.Popen(
