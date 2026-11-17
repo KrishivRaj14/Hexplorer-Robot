@@ -37,10 +37,12 @@ Changed for safety:
     so something that ends up inside the sensors' close blind zone (for
     example after turning in a tight spot) is still avoided
   * the body is 86 x 47 cm, so turning in place sweeps a circle of about
-    0.6 m around its centre: it veers gently away from things that close on
+    0.54 m around its centre: it veers gently away from things that close on
     one side, will not turn if something is inside that circle, and then backs
-    up 0.30 m over the ground it has just walked (known clear) and tries again;
-    after 2 tries it stops ("too tight to turn")
+    if one side is tight and the other is open it side-steps (linear.y) into
+    the open side until it has room; otherwise it backs up 0.30 m over the
+    ground it has just walked (known clear); after 3 tries it stops ("too
+    tight to turn")
 """
 import argparse
 import json
@@ -58,7 +60,7 @@ ROBOT_HALF_WIDTH = 0.235          # manual: standing 86.3 x 47 cm
 ROBOT_HALF_LENGTH = 0.43
 PATH_HALF = ROBOT_HALF_WIDTH + 0.10
 LIDAR_AHEAD = 0.30                # LiDAR is 0.30 m ahead of the body centre (repo TF)
-TURN_RADIUS = math.hypot(ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) + 0.12   # ~0.61 m (0.12 margin for drift)
+TURN_RADIUS = math.hypot(ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) + 0.05   # ~0.54 m (0.05 margin)
 # Self-mask: where the robot's own body can show up, in LiDAR coordinates.
 # Body is behind the LiDAR (centre 0.30 m back, 0.43 m half-length) and 0.47 m
 # wide; ahead of the LiDAR we keep ignoring the first --xmin metres as before.
@@ -176,6 +178,7 @@ class ObstacleMemory:
 
     def __init__(self, cell=0.10, keep_s=15.0, min_pts=3):
         self.cell, self.keep_s, self.min_pts = cell, keep_s, min_pts
+        self.half_diag = cell * math.sqrt(0.5)          # cell centre to its corner
         self.cells = {}                                  # (i, j) -> time seen
 
     def add(self, pts_xy, x, y, yaw, now):
@@ -215,7 +218,19 @@ class ObstacleMemory:
         cx, cy = x - LIDAR_AHEAD * math.cos(yaw), y - LIDAR_AHEAD * math.sin(yaw)
         k = np.array(list(self.cells.keys()), dtype=np.float64)
         d = np.hypot((k[:, 0] + 0.5) * self.cell - cx, (k[:, 1] + 0.5) * self.cell - cy)
-        return int((d < TURN_RADIUS).sum())
+        return int((d - self.half_diag < TURN_RADIUS).sum())
+
+    def turn_blocked_sides(self, x, y, yaw, extra=0.0):
+        """Like turn_blocked, split into (left, right) of the body; extra widens the circle."""
+        if not self.cells:
+            return 0, 0
+        cx, cy = x - LIDAR_AHEAD * math.cos(yaw), y - LIDAR_AHEAD * math.sin(yaw)
+        k = np.array(list(self.cells.keys()), dtype=np.float64)
+        wx, wy = (k[:, 0] + 0.5) * self.cell - cx, (k[:, 1] + 0.5) * self.cell - cy
+        c, s = math.cos(yaw), math.sin(yaw)
+        rx, ry = c * wx + s * wy, -s * wx + c * wy
+        inside = np.hypot(rx, ry) - self.half_diag < TURN_RADIUS + extra
+        return int((inside & (ry > 0)).sum()), int((inside & (ry <= 0)).sum())
 
     def side_near(self, x, y, yaw, margin=0.10):
         """Remembered obstacles just outside turning room, left and right of the body."""
@@ -226,7 +241,7 @@ class ObstacleMemory:
         wx, wy = (k[:, 0] + 0.5) * self.cell - cx, (k[:, 1] + 0.5) * self.cell - cy
         c, s = math.cos(yaw), math.sin(yaw)
         rx, ry = c * wx + s * wy, -s * wx + c * wy
-        near = (np.hypot(rx, ry) < TURN_RADIUS + margin) & (rx > -ROBOT_HALF_LENGTH)
+        near = (np.hypot(rx, ry) - self.half_diag < TURN_RADIUS + margin) & (rx > -ROBOT_HALF_LENGTH)
         return int((near & (ry > 0)).sum()), int((near & (ry < 0)).sum())
 
 
@@ -295,7 +310,7 @@ def run_sensor(a):
     plane = {"coef": None, "t": 0.0}
     mem = ObstacleMemory()
     st = dict(x=None, y=None, yaw=None, pose_t=0.0, lidar_t=0.0, seq=0, l_mem=False, tb=0,
-              near_l=0, near_r=0,
+              near_l=0, near_r=0, tb_l=0, tb_r=0, room_l=0, room_r=0,
               l_ok=False, l_info="", l_front=None, l_side=0, l_open_l=None,
               l_open_r=None, cam_t=0.0, cam_n=0, c_front=None, c_side=0,
               c_strips=[None] * STRIPS)
@@ -323,6 +338,8 @@ def run_sensor(a):
                 res["l_front"], res["l_side"], res["l_mem"] = md, ms, True
             res["tb"] = mem.turn_blocked(st["x"], st["y"], st["yaw"])
             res["near_l"], res["near_r"] = mem.side_near(st["x"], st["y"], st["yaw"])
+            res["tb_l"], res["tb_r"] = mem.turn_blocked_sides(st["x"], st["y"], st["yaw"])
+            res["room_l"], res["room_r"] = mem.turn_blocked_sides(st["x"], st["y"], st["yaw"], 0.25)
         st.update(res)
         st["lidar_t"] = now
         st["seq"] += 1
@@ -340,7 +357,7 @@ def run_sensor(a):
                                                 ("127.0.0.1", a.port)))
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except BaseException:  # noqa  (Ctrl+C or being stopped at the end: exit quietly)
         pass
 
 
@@ -423,6 +440,8 @@ class Brain:
         self.fwd_start = None            # where forward walking began (LiDAR x, y)
         self.back_from = None
         self.backups = 0
+        self.side_from = None            # sidestep: start (x, y, yaw) and direction
+        self.side_dir = 0
 
     def choose_dir(self, m, side):
         if side != 0:
@@ -434,13 +453,13 @@ class Brain:
         return self.turn_dir                   # no preference: keep the last way
 
     def step(self, m, use_cam):
-        """Returns (vx, wz, status, end_reason or None)."""
+        """Returns (vx, vy, wz, status, end_reason or None)."""
         a = self.a
         if not pose_ok(m):
-            return 0.0, 0.0, "", "STOPPED: pose lost"
+            return 0.0, 0.0, 0.0, "", "STOPPED: pose lost"
         d, side, src = merge(m, use_cam)
         if d is None:
-            return 0.0, 0.0, "", f"STOPPED: {src}"
+            return 0.0, 0.0, 0.0, "", f"STOPPED: {src}"
         new_frame = m["seq"] != self.last_seq
         self.last_seq = m["seq"]
         now = time.time()
@@ -453,27 +472,39 @@ class Brain:
             if self.blocked >= 2:
                 self.prog_t = now
                 if m.get("tb", 0) >= 2:
+                    # 1) one side tight, the other side clear: step sideways into the clear side
+                    tl, tr = m.get("tb_l", 0), m.get("tb_r", 0)
+                    rl, rr = m.get("room_l", 0), m.get("room_r", 0)
+                    sd = -1 if (tl >= 2 and rr < 2) else 1 if (tr >= 2 and rl < 2) else 0
+                    if sd != 0 and self.backups < 3:
+                        self.state, self.side_dir, self.blocked = "SIDESTEP", sd, 0
+                        self.side_from = (m["x"], m["y"], m["yaw"])
+                        self.backups += 1
+                        say(f"OBSTACLE {d:.2f} m, too tight to turn: stepping "
+                            f"{'left' if sd > 0 else 'right'} to make room")
+                        return 0.0, 0.0, 0.0, "stopping", None
+                    # 2) back up over ground it has just walked on (known clear)
                     walked = math.hypot(m["x"] - self.fwd_start[0], m["y"] - self.fwd_start[1])
-                    if walked >= a.back + 0.05 and self.backups < 2:
-                        # back up over ground it has just walked on (known clear)
+                    if walked >= a.back + 0.05 and self.backups < 3:
                         self.state, self.back_from, self.blocked = "BACKING", (m["x"], m["y"]), 0
                         self.backups += 1
                         say(f"OBSTACLE {d:.2f} m but too tight to turn: backing up {a.back:.2f} m")
-                        return 0.0, 0.0, "stopping", None
-                    return 0.0, 0.0, "", (f"STOPPED: obstacle {d:.2f} m ahead and something within "
-                                          f"{TURN_RADIUS:.2f} m of the body, too tight to turn safely")
+                        return 0.0, 0.0, 0.0, "stopping", None
+                    return 0.0, 0.0, 0.0, "", (f"STOPPED: obstacle {d:.2f} m ahead and something within "
+                                               f"{TURN_RADIUS:.2f} m of the body on both sides, too tight "
+                                               f"to turn safely")
                 self.state, self.turned, self.prev_yaw, self.clear = "TURNING", 0.0, m["yaw"], 0
                 self.turn_dir = self.choose_dir(m, side)
                 self.blocked = 0
                 say(f"OBSTACLE {d:.2f} m ({src}, {side_word(side)}): turning "
                     f"{'left' if self.turn_dir > 0 else 'right'}")
-                return 0.0, 0.0, "stopping", None
+                return 0.0, 0.0, 0.0, "stopping", None
             # stuck check: walking but not moving
             if self.prog_xy is None or math.hypot(m["x"] - self.prog_xy[0],
                                                   m["y"] - self.prog_xy[1]) > 0.15:
                 self.prog_xy, self.prog_t = (m["x"], m["y"]), now
             elif now - self.prog_t > 10.0:
-                return 0.0, 0.0, "", "STOPPED: not moving forward for 10 s (stuck?)"
+                return 0.0, 0.0, 0.0, "", "STOPPED: not moving forward for 10 s (stuck?)"
             v = a.speed if d > a.slow else a.slow_speed
             # keep turning room: veer gently away from something close on one side
             nl, nr = m.get("near_l", 0), m.get("near_r", 0)
@@ -482,17 +513,38 @@ class Brain:
                 wz, veer = -a.veer, ", veering right"
             elif nr >= 2 and nl < 2:
                 wz, veer = a.veer, ", veering left"
-            return v, wz, f"{'FORWARD' if d > a.slow else 'SLOW'} {d:.2f} m ({src}){veer}", None
+            return v, 0.0, wz, f"{'FORWARD' if d > a.slow else 'SLOW'} {d:.2f} m ({src}){veer}", None
+
+        if self.state == "SIDESTEP":
+            x0, y0, yaw0 = self.side_from
+            dx, dy = m["x"] - x0, m["y"] - y0
+            lat = -math.sin(yaw0) * dx + math.cos(yaw0) * dy        # + = moved left
+            moved = lat * self.side_dir                                  # + = the way we want
+            if moved < -0.04:
+                return 0.0, 0.0, 0.0, "", ("STOPPED: side-step went the WRONG way (the sign of "
+                                           "linear.y is opposite to what I assumed)")
+            if m.get("tb", 0) < 2:
+                self.state, self.blocked = "FORWARD", 2       # room now: turn at once
+                say(f"Room to turn after stepping {abs(lat):.2f} m")
+                return 0.0, 0.0, 0.0, "room to turn", None
+            target_tight = m.get("tb_l", 0) if self.side_dir > 0 else m.get("tb_r", 0)
+            if target_tight >= 2:
+                return 0.0, 0.0, 0.0, "", "STOPPED: no room to step sideways either"
+            if moved > a.side_max:
+                return 0.0, 0.0, 0.0, "", (f"STOPPED: stepped {moved:.2f} m sideways and still "
+                                           f"too tight to turn")
+            if now - self.prog_t > 12.0 and moved < 0.03:
+                return 0.0, 0.0, 0.0, "", "STOPPED: side-step is not moving the robot"
+            return 0.0, self.side_dir * a.side_speed, 0.0, f"SIDESTEP {moved:.2f} m", None
 
         if self.state == "BACKING":
             gone = math.hypot(m["x"] - self.back_from[0], m["y"] - self.back_from[1])
             if gone >= a.back:
                 self.state, self.blocked = "FORWARD", 2      # re-check at once: turn if room now
-                self.fwd_start = (m["x"], m["y"])
-                return 0.0, 0.0, "backed up", None
+                return 0.0, 0.0, 0.0, "backed up", None
             if now - self.prog_t > 15.0 and gone < 0.05:
-                return 0.0, 0.0, "", "STOPPED: could not back up"
-            return -a.back_speed, 0.0, f"BACKING {gone:.2f} of {a.back:.2f} m", None
+                return 0.0, 0.0, 0.0, "", "STOPPED: could not back up"
+            return -a.back_speed, 0.0, 0.0, f"BACKING {gone:.2f} of {a.back:.2f} m", None
 
         # TURNING
         self.turned += wrap(m["yaw"] - self.prev_yaw)
@@ -500,17 +552,17 @@ class Brain:
         self.prog_xy, self.prog_t = None, now
         deg = abs(math.degrees(self.turned))
         if m.get("tb", 0) >= 2:
-            return 0.0, 0.0, "", (f"STOPPED: something came within {TURN_RADIUS:.2f} m of the "
+            return 0.0, 0.0, 0.0, "", (f"STOPPED: something came within {TURN_RADIUS:.2f} m of the "
                                   f"body while turning, too tight to keep turning")
         if deg >= 360:
-            return 0.0, 0.0, "", "STOPPED: turned a full circle and still blocked (boxed in)"
+            return 0.0, 0.0, 0.0, "", "STOPPED: turned a full circle and still blocked (boxed in)"
         if new_frame:
             self.clear = self.clear + 1 if (deg >= a.min_turn and d > a.slow) else 0
         if self.clear >= a.clear_frames:
             self.state, self.fwd_start, self.backups = "FORWARD", None, 0
             say(f"Clear ({d:.2f} m) after turning {deg:.0f} deg: walking")
-            return 0.0, 0.0, "clear", None
-        return 0.0, self.turn_dir * a.turn_rate, f"TURNING {deg:.0f} deg, ahead {d:.2f} m", None
+            return 0.0, 0.0, 0.0, "clear", None
+        return 0.0, 0.0, self.turn_dir * a.turn_rate, f"TURNING {deg:.0f} deg, ahead {d:.2f} m", None
 
 
 # ---------------------------------------------------------------- check
@@ -566,12 +618,12 @@ def run_wander(a, link):
     cmd_pub = node.create_publisher(RobotCommand, "/robot_cmd", 10)
     vel_pub = node.create_publisher(Twist, "/vel_cmd", 10)
 
-    def send(state, vx=0.0, wz=0.0):
+    def send(state, vx=0.0, wz=0.0, vy=0.0):
         c = RobotCommand()
         c.header.stamp = node.get_clock().now().to_msg()
         c.target_state = state
         v = Twist()
-        v.linear.x, v.angular.z = float(vx), float(wz)
+        v.linear.x, v.linear.y, v.angular.z = float(vx), float(vy), float(wz)
         cmd_pub.publish(c)
         vel_pub.publish(v)
 
@@ -603,13 +655,13 @@ def wander_loop(a, link, send, hold, use_cam, node=None, rclpy=None):
                 break
             m = link.get()
             prev = brain.state
-            vx, wz, status, end = brain.step(m, use_cam)
+            vx, vy, wz, status, end = brain.step(m, use_cam)
             if end:
                 reason = end
                 break
             if prev == "FORWARD" and brain.state == "TURNING":
                 turns += 1
-            send(4, vx, wz)
+            send(4, vx, wz, vy)
             if status and time.time() - last_print > 1.0:
                 last_print = time.time()
                 say("  " + status)
@@ -659,6 +711,8 @@ def main():
     ap.add_argument("--veer", type=float, default=0.10, help="rad/s, to keep turning room")
     ap.add_argument("--back", type=float, default=0.30, help="m to back up when too tight to turn")
     ap.add_argument("--back-speed", type=float, default=0.08)
+    ap.add_argument("--side-speed", type=float, default=0.06, help="m/s when side-stepping")
+    ap.add_argument("--side-max", type=float, default=0.35, help="most it side-steps (m)")
     ap.add_argument("--clear-frames", type=int, default=4)
     ap.add_argument("--xmin", type=float, default=0.60)
     ap.add_argument("--zmin", type=float, default=0.10)
