@@ -103,6 +103,22 @@ def stop_signal(signum, frame):
     raise KeyboardInterrupt
 
 
+def ros_init(rclpy):
+    """Start ROS WITHOUT its own Ctrl+C handler. ROS's handler shuts the
+    connection down the moment Ctrl+C is pressed, so the stop / lie-down /
+    damping commands that follow could not be sent ("publisher's context is
+    invalid"). With it off, Ctrl+C reaches our code first and the robot is
+    always stopped and put in damping before ROS is shut down."""
+    try:
+        from rclpy.signals import SignalHandlerOptions
+        rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    except (ImportError, TypeError, AttributeError):
+        rclpy.init()
+    signal.signal(signal.SIGINT, signal.default_int_handler)   # Ctrl+C -> KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop_signal)
+    signal.signal(signal.SIGHUP, stop_signal)
+
+
 class Tracker:
     """Adds up how far the heading has turned (handles the +-180 wrap)."""
 
@@ -186,7 +202,7 @@ def run_turn(a, link):
               "'Relayed ... odom messages'? Try --check.")
         return 1
 
-    rclpy.init()
+    ros_init(rclpy)
     node = Node("turn_test")
     cmd_pub = node.create_publisher(RobotCommand, "/robot_cmd", 10)
     vel_pub = node.create_publisher(Twist, "/vel_cmd", 10)
@@ -246,7 +262,7 @@ def run_with_safe_end(a, link, send, hold, node=None, rclpy=None):
         finally:
             if node is not None:
                 node.destroy_node()
-                rclpy.shutdown()
+                rclpy.try_shutdown()
     return 0 if reason.startswith("reached") else 2
 
 
