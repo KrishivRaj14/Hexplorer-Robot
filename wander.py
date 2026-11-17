@@ -65,7 +65,10 @@ ROBOT_HALF_WIDTH = 0.235          # manual: standing 86.3 x 47 cm
 ROBOT_HALF_LENGTH = 0.43
 PATH_HALF = ROBOT_HALF_WIDTH + 0.10
 LIDAR_AHEAD = 0.30                # LiDAR is 0.30 m ahead of the body centre (repo TF)
-TURN_RADIUS = math.hypot(ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) + 0.05   # ~0.54 m (0.05 margin)
+# Room needed around the body centre to turn in place. The body's corners
+# really sweep ~0.49 m; the default 0.25 m (set with --turn-room) means it
+# practically always just turns, like the previous owner's code.
+TURN_RADIUS = 0.25
 # Self-mask: where the robot's own body can show up, in LiDAR coordinates.
 # Body is behind the LiDAR (centre 0.30 m back, 0.43 m half-length) and 0.47 m
 # wide; ahead of the LiDAR we keep ignoring the first --xmin metres as before.
@@ -151,22 +154,29 @@ def lidar_analyze(pts, a, rng, plane, keep=None):
     p = p[np.isfinite(p).all(axis=1) & np.any(p != 0, axis=1)]
     now = time.time()
     r = np.hypot(p[:, 0], p[:, 1])
-    coef, info = fit_floor(p[(p[:, 0] > a.xmin) & (r < 3.5)], rng)
-    if coef is not None:
-        plane["coef"], plane["t"], plane["src"] = coef, now, "fit"
-    elif plane["coef"] is None:
-        # The floor is learned once and then kept: the LiDAR is bolted to the
-        # robot and the house floor is flat, so it does not move relative to
-        # the LiDAR. A frame showing too little floor (facing furniture) just
-        # keeps the floor it already knows.
-        return dict(l_ok=False, l_info=info, l_front=None, l_side=0,
-                    l_open_l=None, l_open_r=None, l_fit_t=0.0)
-    ca, cb, cc = plane["coef"]
-    h = p[:, 2] - (ca * p[:, 0] + cb * p[:, 1] + cc)
+    if not a.floor_mode:
+        # The previous owner's method (obstacle_avoidance.py): a fixed height
+        # band measured from the LiDAR itself, no floor finding. Things lower
+        # than the band (boxes, shoes) are left to the camera, as in his code.
+        h, lo, hi, info = p[:, 2], a.band_lo, a.band_hi, "fixed height band"
+        plane["t"] = now
+    else:
+        lo, hi = a.zmin, a.zmax
+        coef, info = fit_floor(p[(p[:, 0] > a.xmin) & (r < 3.5)], rng)
+        if coef is not None:
+            plane["coef"], plane["t"], plane["src"] = coef, now, "fit"
+        elif plane["coef"] is None:
+            # The floor is learned once and then kept: the LiDAR is bolted to
+            # the robot and the house floor is flat. A frame showing too little
+            # floor (facing furniture) just keeps the floor it already knows.
+            return dict(l_ok=False, l_info=info, l_front=None, l_side=0,
+                        l_open_l=None, l_open_r=None, l_fit_t=0.0)
+        ca, cb, cc = plane["coef"]
+        h = p[:, 2] - (ca * p[:, 0] + cb * p[:, 1] + cc)
     own = (np.abs(p[:, 1]) < SELF_HALF_WIDTH) & (p[:, 0] > -SELF_BACK) & (p[:, 0] < a.xmin)
     own |= ((np.abs(p[:, 1]) < TAIL_HALF_WIDTH) & (p[:, 0] <= -SELF_BACK)
             & (p[:, 0] > -SELF_BACK - TAIL_LEN))                    # cable behind
-    obst = p[(h > a.zmin) & (h < a.zmax) & ~own & (r > 0.15)]
+    obst = p[(h > lo) & (h < hi) & ~own & (r > 0.15)]
     if keep is not None:
         keep["obst"] = obst[np.hypot(obst[:, 0], obst[:, 1]) < 2.5, :2]
     out = dict(l_ok=True, l_info=info, l_front=None, l_side=0, l_fit_t=plane["t"])
@@ -430,13 +440,13 @@ def run_sensor(a):
         if now - fstate["checked"] > 0.5:
             fstate["checked"], fstate["since"] = now, read_state()
         since = fstate["since"]
-        if (since is not None and plane["t"] < since and now - since > 1.5
+        if (a.floor_mode and since is not None and plane["t"] < since and now - since > 1.5
                 and fstate["saved"] is not None):
             plane["coef"], plane["t"], plane["src"] = fstate["saved"], now, "saved"
         keep = {}
         t_before = plane["t"]
         res = lidar_analyze(buf, a, rng, plane, keep)
-        if (since is not None and plane.get("src") == "fit" and plane["t"] != t_before
+        if (a.floor_mode and since is not None and plane.get("src") == "fit" and plane["t"] != t_before
                 and now - since > 1.0 and now - fstate["saved_t"] > 10.0):
             save_floor(plane["coef"])
             fstate["saved"], fstate["saved_t"] = plane["coef"], now
@@ -856,11 +866,21 @@ def main():
     ap.add_argument("--side-max", type=float, default=0.35, help="most it side-steps (m)")
     ap.add_argument("--clear-frames", type=int, default=4)
     ap.add_argument("--xmin", type=float, default=0.60)
+    ap.add_argument("--band-lo", type=float, default=0.05,
+                    help="LiDAR obstacles: lowest height ABOVE THE LIDAR (his value)")
+    ap.add_argument("--band-hi", type=float, default=1.2,
+                    help="LiDAR obstacles: highest height above the LiDAR (his value)")
+    ap.add_argument("--floor-mode", action="store_true",
+                    help="measure LiDAR obstacles from the floor instead (finds the floor)")
+    ap.add_argument("--turn-room", type=float, default=0.25,
+                    help="room (m from body centre) needed to turn in place; 0.25 = just turn")
     ap.add_argument("--zmin", type=float, default=0.10)
     ap.add_argument("--zmax", type=float, default=1.00)
     ap.add_argument("--port", type=int, default=45680)
     ap.add_argument("--sensor-rmw", default="rmw_cyclonedds_cpp")
     a = ap.parse_args()
+    global TURN_RADIUS
+    TURN_RADIUS = a.turn_room
 
     if a.sensor:
         run_sensor(a)
@@ -877,7 +897,9 @@ def main():
     env = dict(os.environ, RMW_IMPLEMENTATION=a.sensor_rmw)
     helper = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--sensor", "--port", str(a.port),
-         "--xmin", str(a.xmin), "--zmin", str(a.zmin), "--zmax", str(a.zmax)], env=env)
+         "--xmin", str(a.xmin), "--zmin", str(a.zmin), "--zmax", str(a.zmax),
+         "--band-lo", str(a.band_lo), "--band-hi", str(a.band_hi),
+         "--turn-room", str(a.turn_room)] + (["--floor-mode"] if a.floor_mode else []), env=env)
     try:
         return run_check(a, link) if a.check else run_wander(a, link)
     except KeyboardInterrupt:
