@@ -25,7 +25,8 @@ Built from the previous owner's obstacle_avoidance.py:
 Changed for safety:
   * LiDAR obstacles are measured as height above the FLOOR (from walk_safe.py),
     because the LiDAR is tilted and his fixed height band sees the floor
-  * no sensor data = STOP (his code treated it as "clear")
+  * no sensor data = STOP (his code treated it as "clear"): a short gap makes
+    it stand still and wait up to 2 s, longer than that ends the run
   * speeds 0.15 m/s and 0.15 rad/s (his script used 0.5 m/s, over the limit)
   * turning is measured by the LiDAR heading; no blind reversing; if it has
     turned a full circle and is still blocked, it stops ("boxed in")
@@ -441,6 +442,7 @@ class Brain:
         self.back_from = None
         self.backups = 0
         self.side_from = None            # sidestep: start (x, y, yaw) and direction
+        self.bad_since = None            # when sensor data first went missing
         self.side_dir = 0
 
     def choose_dir(self, m, side):
@@ -455,14 +457,26 @@ class Brain:
     def step(self, m, use_cam):
         """Returns (vx, vy, wz, status, end_reason or None)."""
         a = self.a
+        now = time.time()
+        # A short gap in sensor data (the pose or LiDAR arriving late): stand
+        # still and wait up to --grace seconds; longer than that: stop.
+        bad = None
         if not pose_ok(m):
-            return 0.0, 0.0, 0.0, "", "STOPPED: pose lost"
-        d, side, src = merge(m, use_cam)
-        if d is None:
-            return 0.0, 0.0, 0.0, "", f"STOPPED: {src}"
+            bad = "pose lost"
+        else:
+            d, side, src = merge(m, use_cam)
+            if d is None:
+                bad = src
+        if bad:
+            if self.bad_since is None:
+                self.bad_since = now
+            if now - self.bad_since > a.grace:
+                return 0.0, 0.0, 0.0, "", f"STOPPED: {bad} for over {a.grace:.0f} s"
+            self.prog_t = now
+            return 0.0, 0.0, 0.0, f"waiting: {bad}", None
+        self.bad_since = None
         new_frame = m["seq"] != self.last_seq
         self.last_seq = m["seq"]
-        now = time.time()
 
         if self.state == "FORWARD":
             if new_frame:
@@ -711,6 +725,8 @@ def main():
     ap.add_argument("--veer", type=float, default=0.10, help="rad/s, to keep turning room")
     ap.add_argument("--back", type=float, default=0.30, help="m to back up when too tight to turn")
     ap.add_argument("--back-speed", type=float, default=0.08)
+    ap.add_argument("--grace", type=float, default=2.0,
+                    help="seconds to stand still waiting for late sensor data before stopping")
     ap.add_argument("--side-speed", type=float, default=0.06, help="m/s when side-stepping")
     ap.add_argument("--side-max", type=float, default=0.35, help="most it side-steps (m)")
     ap.add_argument("--clear-frames", type=int, default=4)
