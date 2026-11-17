@@ -34,6 +34,10 @@ Changed for safety:
   * ignores only the robot's own outline (behind the LiDAR, 0.64 m wide, plus
     the first 0.6 m straight ahead) instead of everything within 0.6 m, so
     walls and furniture right beside the robot are seen
+  * ignores its own network cable: a 0.35 m strip right behind the body is
+    ignored (where the cable drops off), and something only counts in the
+    memory once it stays in the same place in the room while the robot walks
+    20 cm (furniture does, the cable moves with the robot)
   * remembers LiDAR obstacles for 15 s on the floor (using the Fast-LIO pose),
     so something that ends up inside the sensors' close blind zone (for
     example after turning in a tight spot) is still avoided
@@ -67,6 +71,10 @@ TURN_RADIUS = math.hypot(ROBOT_HALF_LENGTH, ROBOT_HALF_WIDTH) + 0.05   # ~0.54 m
 # wide; ahead of the LiDAR we keep ignoring the first --xmin metres as before.
 SELF_HALF_WIDTH = 0.32
 SELF_BACK = LIDAR_AHEAD + ROBOT_HALF_LENGTH + 0.05                        # 0.78 m
+# Tail zone: the network cable drops off the back of the robot. Ignore a strip
+# 0.35 m long directly behind the body (anything there would be touching it).
+TAIL_LEN = 0.35
+TAIL_HALF_WIDTH = SELF_HALF_WIDTH + 0.03
 
 # camera (from the previous owner's obstacle_avoidance.py, widened to 8 strips)
 CAM_X0, CAM_X1, CAM_Y0, CAM_Y1 = 20, 620, 80, 300
@@ -152,6 +160,8 @@ def lidar_analyze(pts, a, rng, plane, keep=None):
     ca, cb, cc = plane["coef"]
     h = p[:, 2] - (ca * p[:, 0] + cb * p[:, 1] + cc)
     own = (np.abs(p[:, 1]) < SELF_HALF_WIDTH) & (p[:, 0] > -SELF_BACK) & (p[:, 0] < a.xmin)
+    own |= ((np.abs(p[:, 1]) < TAIL_HALF_WIDTH) & (p[:, 0] <= -SELF_BACK)
+            & (p[:, 0] > -SELF_BACK - TAIL_LEN))                    # cable behind
     obst = p[(h > a.zmin) & (h < a.zmax) & ~own & (r > 0.15)]
     if keep is not None:
         keep["obst"] = obst[np.hypot(obst[:, 0], obst[:, 1]) < 2.5, :2]
@@ -175,14 +185,35 @@ class ObstacleMemory:
     """Short-term memory of LiDAR obstacles on the floor (10 cm squares, world
     coordinates from Fast-LIO), kept for 15 s. Both sensors are blind up close
     (LiDAR < 0.6 m, camera < 0.5 m), so something seen earlier that is now very
-    close, for example after turning in a tight spot, is still known."""
+    close, for example after turning in a tight spot, is still known.
+
+    Things attached to the robot (its network cable) move WITH the robot, so
+    they never stay in one place in the room. A square only becomes a remembered
+    obstacle once it has been seen continuously while the robot WALKED 20 cm
+    (turning in place does not count: a cable curving around the robot looks
+    the same while it spins). Furniture passes that within about a second and a
+    half of walking; the cable does not. Squares seen while the robot has not moved yet since
+    the start count at once (so a wall beside the start is known), but are
+    forgotten after 3 s unless they are confirmed that way too."""
+
+    CONFIRM_MOVE = 0.20          # m walked while the square stays in view
+    PENDING_KEEP = 0.4           # s: an unconfirmed square must be seen (almost) every frame
+    START_KEEP = 3.0             # s: squares from the start position
 
     def __init__(self, cell=0.10, keep_s=15.0, min_pts=3):
         self.cell, self.keep_s, self.min_pts = cell, keep_s, min_pts
         self.half_diag = cell * math.sqrt(0.5)          # cell centre to its corner
-        self.cells = {}                                  # (i, j) -> time seen
+        self.cells = {}          # confirmed: (i, j) -> [time seen, "view" | "start"]
+        self.pending = {}        # unconfirmed: (i, j) -> [time seen, x, y, yaw when first seen]
+        self.start_pose = None
+
+    def _moved(self, x0, y0, yaw0, x, y, yaw):
+        return math.hypot(x - x0, y - y0) >= self.CONFIRM_MOVE
 
     def add(self, pts_xy, x, y, yaw, now):
+        if self.start_pose is None:
+            self.start_pose = (x, y, yaw)
+        at_start = not self._moved(*self.start_pose, x, y, yaw)
         if len(pts_xy):
             c, s = math.cos(yaw), math.sin(yaw)
             wx = x + c * pts_xy[:, 0] - s * pts_xy[:, 1]
@@ -190,11 +221,30 @@ class ObstacleMemory:
             k = np.c_[np.floor(wx / self.cell), np.floor(wy / self.cell)].astype(np.int64)
             keys, counts = np.unique(k, axis=0, return_counts=True)
             for (i, j), n in zip(keys, counts):
-                if n >= self.min_pts:
-                    self.cells[(int(i), int(j))] = now
-        old = [kk for kk, t in self.cells.items() if now - t > self.keep_s]
-        for kk in old:
+                if n < self.min_pts:
+                    continue
+                key = (int(i), int(j))
+                if key in self.cells:
+                    e = self.cells[key]
+                    e[0] = now
+                    if e[1] == "start" and not at_start:
+                        e[1] = "view"            # still there after moving: real
+                elif key in self.pending:
+                    pe = self.pending[key]
+                    if self._moved(pe[1], pe[2], pe[3], x, y, yaw):
+                        self.cells[key] = [now, "view"]
+                        del self.pending[key]
+                    else:
+                        pe[0] = now
+                elif at_start:
+                    self.cells[key] = [now, "start"]
+                else:
+                    self.pending[key] = [now, x, y, yaw]
+        for kk in [kk for kk, e in self.cells.items()
+                   if now - e[0] > (self.keep_s if e[1] == "view" else self.START_KEEP)]:
             del self.cells[kk]
+        for kk in [kk for kk, e in self.pending.items() if now - e[0] > self.PENDING_KEEP]:
+            del self.pending[kk]
 
     def front(self, x, y, yaw):
         """Nearest remembered obstacle in the path ahead (0-1.2 m) and its side."""
