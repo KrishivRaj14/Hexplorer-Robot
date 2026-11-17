@@ -154,7 +154,10 @@ def lidar_analyze(pts, a, rng, plane, keep=None):
     coef, info = fit_floor(p[(p[:, 0] > a.xmin) & (r < 3.5)], rng)
     if coef is not None:
         plane["coef"], plane["t"] = coef, now
-    elif plane["coef"] is None or now - plane["t"] > 1.0:
+    elif plane["coef"] is None or now - plane["t"] > a.floor_hold:
+        # (the LiDAR is bolted to the robot, so the floor stays where it was
+        #  relative to it: keep the last good floor for --floor-hold seconds
+        #  when too little floor is in view, e.g. facing furniture)
         return dict(l_ok=False, l_info=info, l_front=None, l_side=0,
                     l_open_l=None, l_open_r=None)
     ca, cb, cc = plane["coef"]
@@ -283,7 +286,7 @@ class ObstacleMemory:
         inside = np.hypot(rx, ry) - self.half_diag < TURN_RADIUS + extra
         return int((inside & (ry > 0)).sum()), int((inside & (ry <= 0)).sum())
 
-    def side_near(self, x, y, yaw, margin=0.10):
+    def side_near(self, x, y, yaw, margin=0.0):
         """Remembered obstacles just outside turning room, left and right of the body."""
         if not self.cells:
             return 0, 0
@@ -331,7 +334,9 @@ def merge(m, use_cam, cam_max_age=3.0):
     lidar_ok = m["l_ok"] and now - m["lidar_t"] < 1.0
     cam_ok = now - m["cam_t"] < cam_max_age
     if not lidar_ok:
-        return None, 0, "LiDAR lost or floor not found"
+        if now - m["lidar_t"] >= 1.0:
+            return None, 0, "LiDAR data stopped arriving"
+        return None, 0, f"floor not found ({m.get('l_info', '')})"
     if use_cam and not cam_ok:
         return None, 0, "camera lost"
     ld = m["l_front"] if m["l_front"] is not None else 9.0
@@ -781,6 +786,8 @@ def main():
     ap.add_argument("--side-max", type=float, default=0.35, help="most it side-steps (m)")
     ap.add_argument("--clear-frames", type=int, default=4)
     ap.add_argument("--xmin", type=float, default=0.60)
+    ap.add_argument("--floor-hold", type=float, default=10.0,
+                    help="seconds to keep using the last floor when too little floor is in view")
     ap.add_argument("--zmin", type=float, default=0.10)
     ap.add_argument("--zmax", type=float, default=1.00)
     ap.add_argument("--port", type=int, default=45680)
@@ -801,7 +808,8 @@ def main():
     env = dict(os.environ, RMW_IMPLEMENTATION=a.sensor_rmw)
     helper = subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--sensor", "--port", str(a.port),
-         "--xmin", str(a.xmin), "--zmin", str(a.zmin), "--zmax", str(a.zmax)], env=env)
+         "--xmin", str(a.xmin), "--zmin", str(a.zmin), "--zmax", str(a.zmax),
+         "--floor-hold", str(a.floor_hold)], env=env)
     try:
         return run_check(a, link) if a.check else run_wander(a, link)
     except KeyboardInterrupt:
