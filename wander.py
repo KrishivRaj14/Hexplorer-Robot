@@ -24,8 +24,12 @@ Built from the previous owner's obstacle_avoidance.py:
   * after turning, wait for several clear readings before walking again
   * same lie-down order at the end: 3 -> 1 -> 0
 Changed for safety:
-  * LiDAR obstacles are measured as height above the FLOOR (from walk_safe.py),
-    because the LiDAR is tilted and his fixed height band sees the floor
+  * LiDAR points are straightened with the LiDAR's own IMU (gravity) before
+    his height band is applied: the LiDAR is tilted ~12 deg forward, so without
+    this the floor ~2 m ahead counted as an obstacle (closer while bobbing)
+  * no averaging of camera and LiDAR: the LiDAR decides, the camera only stops
+    the robot for something in the path closer than 0.8 m that the LiDAR
+    does not see (low things below his band)
   * no sensor data = STOP (his code treated it as "clear"): a short gap makes
     it stand still and wait up to 2 s, longer than that ends the run
   * speeds 0.15 m/s and 0.15 rad/s (his script used 0.5 m/s, over the limit)
@@ -85,6 +89,7 @@ CAM_X0, CAM_X1, CAM_Y0, CAM_Y1 = 20, 620, 80, 300
 CAM_MIN, CAM_MAX = 0.5, 5.0
 STRIPS = 8
 FX = 337.0                        # approx. focal length (px), 87 deg over 640 px
+CAM_VETO = 0.8                    # camera overrides the LiDAR only for things closer than this
 
 
 # ---------------------------------------------------------------- LiDAR (walk_safe.py)
@@ -363,11 +368,13 @@ def merge(m, use_cam, cam_max_age=3.0):
     cam_yaw = m.get("cam_yaw")
     fresh_dir = (cam_yaw is not None and m.get("yaw") is not None
                  and abs(wrap(m["yaw"] - cam_yaw)) < math.radians(10))
+    # The LiDAR decides. The camera only steps in when it sees something in the
+    # path closer than 0.8 m that the LiDAR does not (low things the LiDAR's
+    # band ignores). No averaging: with nothing in view the camera reports the
+    # floor at ~1.5 m (its limit), which is not a real distance to average.
     if use_cam and fresh_dir and m["c_front"] is not None:
         cd = m["c_front"]
-        if abs(cd - ld) < 0.5:                       # both agree -> average
-            d, src = (cd + ld) / 2.0, "both"
-        elif cd < 0.8 and cd < ld:                   # camera sees something very close
+        if cd < CAM_VETO and cd < ld:
             d, side, src = cd, m["c_side"], "camera"
     return d, side, src
 
@@ -456,7 +463,7 @@ def view_info(st, a, use_cam):
                 l_info=st["l_info"], c_front=st["c_front"], c_side=side_word(st["c_side"]),
                 cam_age=now - st["cam_t"] if st["cam_t"] else None, cam_dir_ok=fresh_dir,
                 c_strips=st["c_strips"], c_inpath=inpath,
-                tb=st["tb"], near_l=st["near_l"], near_r=st["near_r"],
+                tb=st["tb"], near_l=st["near_l"], near_r=st["near_r"], tilt=st.get("tilt"),
                 stop=a.stop, slow=a.slow)
 
 
@@ -555,7 +562,7 @@ function table(el,d){el.innerHTML=
  "<tr><td><b>merged</b></td><td>"+f(d.merged)+" m via "+d.merged_src+", obstacle side "+d.merged_side+"</td></tr>"+
  "<tr><td><b>decision</b></td><td>"+d.action+"</td></tr>"+
  "<tr><td>turn room</td><td>"+(d.tb>=2?"TOO CLOSE TO TURN":"ok")+" (near L "+d.near_l+", R "+d.near_r+")</td></tr>"+
- "<tr><td>LiDAR mode</td><td>"+d.l_info+"</td></tr>"}
+ "<tr><td>LiDAR mode</td><td>"+d.l_info+", LiDAR tilt "+(d.tilt===null||d.tilt===undefined?"UNKNOWN (no IMU data: not straightened)":f(d.tilt)+" deg, straightened")+"</td></tr>"}
 function strips(el,d){el.querySelectorAll(".strip").forEach(e=>e.remove());
  for(let i=0;i<8;i++){const s=document.createElement("div");const v=d.c_strips[i];
   s.className="strip"+(d.c_inpath[i]?" inpath":"")+(d.c_inpath[i]&&v!==null&&v<d.stop?" close":"");
@@ -662,6 +669,24 @@ def robot_frame_cells(mem, x, y, yaw):
     return list(zip(rx[sel].tolist(), ry[sel].tolist()))
 
 
+def level_rotation(acc):
+    """Rotation that turns LiDAR coordinates into LEVEL coordinates, from the
+    IMU's accelerometer (at rest it points straight up). Only tilt is removed,
+    not the heading. Returns a 3x3 matrix, or None."""
+    up = np.asarray(acc, dtype=np.float64)
+    n = np.linalg.norm(up)
+    if n < 1e-6:
+        return None
+    up /= n
+    ez = np.array([0.0, 0.0, 1.0])
+    v = np.cross(up, ez)
+    c = float(up @ ez)
+    if c < 0.5:                       # tilted more than 60 deg: not plausible
+        return None
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx / (1.0 + c)
+
+
 def run_sensor(a):
     import rclpy
     from rclpy.node import Node
@@ -681,12 +706,21 @@ def run_sensor(a):
               near_l=0, near_r=0, tb_l=0, tb_r=0, room_l=0, room_r=0,
               l_ok=False, l_info="", l_front=None, l_side=0, l_open_l=None,
               l_open_r=None, cam_t=0.0, cam_n=0, cam_yaw=None, c_front=None, c_side=0,
-              c_strips=[None] * STRIPS)
+              c_strips=[None] * STRIPS, tilt=None)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     view = LiveView(a) if a.view_port else None
     if view is not None and not view.ok:
         view = None
     use_cam = not a.no_camera
+    imu = {"acc": None, "t": 0.0}
+
+    def on_imu(m):
+        # Average the accelerometer over ~1 s: that is the direction of
+        # gravity, i.e. how the LiDAR is tilted (bobbing included, slowly).
+        v = np.array([m.linear_acceleration.x, m.linear_acceleration.y,
+                      m.linear_acceleration.z], dtype=np.float64)
+        imu["acc"] = v if imu["acc"] is None else 0.99 * imu["acc"] + 0.01 * v
+        imu["t"] = time.time()
 
     def on_pose(m):
         q = m.pose.pose.orientation
@@ -700,6 +734,15 @@ def run_sensor(a):
         buf = np.frombuffer(bytes(m.data), dtype=np.float32)
         buf = buf[: (len(buf) // step) * step].reshape(-1, step)
         now = time.time()
+        # Straighten the points with the IMU: the LiDAR is tilted ~12 deg
+        # forward, so without this the floor ~2 m ahead "rises" into the
+        # obstacle band (and closer when the robot bobs while walking).
+        R = level_rotation(imu["acc"]) if (imu["acc"] is not None and now - imu["t"] < 0.5) else None
+        if R is not None:
+            buf = buf[:, :3] @ R.T.astype(np.float32)
+            st["tilt"] = float(np.degrees(np.arccos(np.clip(R[2, 2], -1, 1))))
+        else:
+            st["tilt"] = None
         # Floor while standing: the robot's own standing floor never changes,
         # so it is saved to a file the first time it is seen and reused when a
         # run starts somewhere with no floor in view (e.g. facing a door).
@@ -746,6 +789,8 @@ def run_sensor(a):
         st["cam_yaw"] = st["yaw"]           # heading when this picture arrived
         st["cam_n"] += 1
 
+    from sensor_msgs.msg import Imu
+    node.create_subscription(Imu, "/livox/imu", on_imu, qos)
     node.create_subscription(Odometry, "/lidar_odometry/pose", on_pose, qos)
     node.create_subscription(PointCloud2, "/livox/lidar", on_cloud, qos)
     node.create_subscription(Image, "/camera/depth/image_raw", on_depth, qos)
