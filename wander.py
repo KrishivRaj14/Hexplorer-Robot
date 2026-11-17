@@ -352,7 +352,13 @@ def merge(m, use_cam, cam_max_age=3.0):
         return None, 0, "camera lost"
     ld = m["l_front"] if m["l_front"] is not None else 9.0
     d, side, src = ld, m["l_side"], "lidar"
-    if use_cam and m["c_front"] is not None:
+    # The camera sends ~2 pictures a second and a picture can be up to 2 s old.
+    # A picture taken before the robot turned shows the OLD direction: ignore
+    # it if the heading has changed more than 10 degrees since it was taken.
+    cam_yaw = m.get("cam_yaw")
+    fresh_dir = (cam_yaw is not None and m.get("yaw") is not None
+                 and abs(wrap(m["yaw"] - cam_yaw)) < math.radians(10))
+    if use_cam and fresh_dir and m["c_front"] is not None:
         cd = m["c_front"]
         if abs(cd - ld) < 0.5:                       # both agree -> average
             d, src = (cd + ld) / 2.0, "both"
@@ -418,7 +424,7 @@ def run_sensor(a):
     st = dict(x=None, y=None, yaw=None, pose_t=0.0, lidar_t=0.0, seq=0, l_mem=False, tb=0, l_fit_t=0.0,
               near_l=0, near_r=0, tb_l=0, tb_r=0, room_l=0, room_r=0,
               l_ok=False, l_info="", l_front=None, l_side=0, l_open_l=None,
-              l_open_r=None, cam_t=0.0, cam_n=0, c_front=None, c_side=0,
+              l_open_r=None, cam_t=0.0, cam_n=0, cam_yaw=None, c_front=None, c_side=0,
               c_strips=[None] * STRIPS)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -470,6 +476,7 @@ def run_sensor(a):
         d = np.frombuffer(bytes(m.data), dtype=np.uint16).reshape(m.height, m.width)
         st.update(cam_analyze(d))
         st["cam_t"] = time.time()
+        st["cam_yaw"] = st["yaw"]           # heading when this picture arrived
         st["cam_n"] += 1
 
     node.create_subscription(Odometry, "/lidar_odometry/pose", on_pose, qos)
@@ -692,7 +699,10 @@ class Brain:
         if deg >= 360:
             return 0.0, 0.0, 0.0, "", "STOPPED: turned a full circle and still blocked (boxed in)"
         if new_frame:
-            self.clear = self.clear + 1 if (deg >= a.min_turn and d > a.slow) else 0
+            # "clear" is judged by the LiDAR alone while turning: it sees the new
+            # direction at once, the camera lags up to 2 s and made it over-turn
+            ld = m["l_front"] if m["l_front"] is not None else 9.0
+            self.clear = self.clear + 1 if (deg >= a.min_turn and ld > a.slow) else 0
         if self.clear >= a.clear_frames:
             self.state, self.fwd_start, self.backups = "FORWARD", None, 0
             say(f"Clear ({d:.2f} m) after turning {deg:.0f} deg: walking")
@@ -864,7 +874,7 @@ def main():
                     help="seconds to stand still waiting for late sensor data before stopping")
     ap.add_argument("--side-speed", type=float, default=0.06, help="m/s when side-stepping")
     ap.add_argument("--side-max", type=float, default=0.35, help="most it side-steps (m)")
-    ap.add_argument("--clear-frames", type=int, default=4)
+    ap.add_argument("--clear-frames", type=int, default=2)
     ap.add_argument("--xmin", type=float, default=0.60)
     ap.add_argument("--band-lo", type=float, default=0.05,
                     help="LiDAR obstacles: lowest height ABOVE THE LIDAR (his value)")
